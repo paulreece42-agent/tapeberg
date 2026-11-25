@@ -7,6 +7,19 @@ tape TB0003L5" — and waits for `tapeberg ack`.
 
 ## Set up
 
+Config: any `TAPEBERG_*` env var can live in a conf file instead —
+`/etc/tapeberg.conf` or `~/.config/tapeberg.conf` (or `$TAPEBERG_CONF`),
+`key = value` lines, keys minus the prefix. Env vars override the file;
+chmod 600 (it carries credentials):
+
+```ini
+db_url = postgres://tapeberg:...@127.0.0.1:5432/tapeberg
+drive = /dev/nst0
+buffer = /var/lib/tapeberg
+changer = manual
+telegram_token = ...        # or webhook_url / webhook_token
+```
+
 ```sh
 go build -o tapeberg .
 export TAPEBERG_DB_URL=postgres://...        # catalog (db/migrations/)
@@ -17,6 +30,7 @@ export TAPEBERG_CHANGER=manual              # or robot (autochanger)
 export TAPEBERG_TELEGRAM_TOKEN=... TAPEBERG_TELEGRAM_CHAT=...
 export TAPEBERG_WEBHOOK_URL=...             # POSTs {"text": ...} (Slack incoming-webhook shape)
 tapeberg doctor                             # readiness check
+tapeberg tape add 000259L5                  # register a new tape (capacity hint default 1500GB)
 ```
 
 Run the worker from cron (see `deploy/tapeberg-worker.cron`). In manual
