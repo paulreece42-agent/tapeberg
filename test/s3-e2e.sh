@@ -31,7 +31,7 @@ set -a; . "$ROOT/.env"; set +a
 # notification channels) — the conf file belongs to the real rig.
 export TAPEBERG_CONF=/dev/null
 unset TAPEBERG_TELEGRAM_TOKEN TAPEBERG_TELEGRAM_CHAT TAPEBERG_WEBHOOK_URL TAPEBERG_WEBHOOK_TOKEN
-export TAPEBERG_DRIVE="$DRIVE" TAPEBERG_CHANGER=robot TAPEBERG_CHANGER_DEV="$CHANGER_DEV"
+export TAPEBERG_DRIVE="$DRIVE" TAPEBERG_CHANGER=robot TAPEBERG_CHANGER_DEV="$CHANGER_DEV" TAPEBERG_POOL=vtl
 export TAPEBERG_BUFFER="$WORK/buffer"
 export TAPEBERG_S3_KEY="tapeberg-test" TAPEBERG_S3_SECRET="tapeberg-test-secret"
 mkdir -p "$TAPEBERG_BUFFER"
@@ -49,11 +49,11 @@ for bc in TB0001L5 TB0002L5 TB0003L5; do
   mt -f "$DRIVE" rewind
   mtx -f "$CHANGER_DEV" unload >/dev/null
 done
-$PSQL -c "DELETE FROM retrieve_requests;
-DELETE FROM archive_requests;
-DELETE FROM tape_files;
-UPDATE tapes SET state='active', written_bytes=0;
-DELETE FROM objects;" >/dev/null
+$PSQL -c "DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 's3e2e%');
+DELETE FROM archive_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 's3e2e%');
+DELETE FROM tape_files WHERE tape_id IN (SELECT id FROM tapes WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl'));
+UPDATE tapes SET state='active', written_bytes=0 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl');
+DELETE FROM objects WHERE key LIKE 's3e2e%';" >/dev/null
 
 say "starting the S3 endpoint"
 "$BIN" s3 127.0.0.1:7333 &

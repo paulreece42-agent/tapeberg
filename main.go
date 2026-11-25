@@ -178,7 +178,7 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader) (*Obj
 		os.Remove(dst)
 		return nil, err
 	}
-	if err := createArchiveRequest(db, obj.ID); err != nil {
+	if err := createArchiveRequest(db, obj.ID, cfg.Pool); err != nil {
 		return nil, err
 	}
 	return obj, nil
@@ -200,7 +200,7 @@ func cmdRestore(cfg Config, key string, days int) error {
 		fmt.Printf("%s is already on disk (restored); no new request needed\n", key)
 		return nil
 	}
-	if err := createRetrieveRequest(db, obj.ID, days); err != nil {
+	if err := createRetrieveRequest(db, obj.ID, days, cfg.Pool); err != nil {
 		return err
 	}
 	fmt.Printf("restore queued for %s (pin %d days) — run 'tapeberg worker' to drain it\n", key, days)
@@ -297,9 +297,9 @@ func cmdTapeAdd(cfg Config, args []string) error {
 	defer db.Close()
 	inserted, err := db.Exec(`
 		INSERT INTO tapes (barcode, pool_id, is_cleaning, capacity_bytes)
-		VALUES ($1, (SELECT id FROM tape_pools WHERE name = 'default'), $2, $3)
+		VALUES ($1, (SELECT id FROM tape_pools WHERE name = $2), $3, $4)
 		ON CONFLICT (barcode) DO NOTHING`,
-		barcode, strings.HasPrefix(strings.ToUpper(barcode), "CLN"), capacity)
+		barcode, cfg.Pool, strings.HasPrefix(strings.ToUpper(barcode), "CLN"), capacity)
 	if err != nil {
 		return err
 	}
@@ -320,6 +320,7 @@ func LoadConfig() (Config, error) {
 		ChangerMode: envDefault("TAPEBERG_CHANGER", "robot"),
 		ChangerDev:  os.Getenv("TAPEBERG_CHANGER_DEV"),
 		AckDir:      envDefault("TAPEBERG_ACK_DIR", "/run/tapeberg"),
+		Pool:        envDefault("TAPEBERG_POOL", "default"),
 		S3Listen:    envDefault("TAPEBERG_S3_LISTEN", ":7333"),
 		S3Key:       os.Getenv("TAPEBERG_S3_KEY"),
 		S3Secret:    os.Getenv("TAPEBERG_S3_SECRET"),
