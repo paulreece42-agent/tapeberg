@@ -29,6 +29,8 @@ usage:
   tapeberg restore <key> [days]      queue a Glacier-style restore (default 1 day, max 30)
   tapeberg get <key>                 cat a restored object to stdout
   tapeberg tape add <barcode> [capacity]  register a tape in the catalog (capacity like 1500GB; default 1500GB, LTO-5)
+  tapeberg user <subcommand>         manage S3 users (add/rm/ls/info/suspend/unsuspend; --full-name, --email, --admin)
+  tapeberg key <subcommand>         manage S3 keys (add --uid, rm --access-key; users may hold several)
   tapeberg status                    catalog + queue summary
   tapeberg worker                    drain archive/restore queues once (run from cron)
   tapeberg s3 [listen-addr]          serve the S3/Glacier wire protocol (default :7333)
@@ -105,6 +107,12 @@ func run(args []string) error {
 		}
 		return cmdTapeAdd(cfg, rest[1:])
 
+	case "user":
+		return cmdUser(cfg, rest)
+
+	case "key":
+		return cmdKey(cfg, rest)
+
 	case "status":
 		return cmdStatus(cfg)
 
@@ -143,7 +151,7 @@ func cmdIngest(cfg Config, src, key string) error {
 		return err
 	}
 	defer in.Close()
-	obj, err := ingestStream(db, cfg, "tapeberg", key, in, cfg.Pool)
+	obj, err := ingestStream(db, cfg, "tapeberg", key, in, cfg.Pool, 0)
 	if err != nil {
 		return err
 	}
@@ -153,7 +161,8 @@ func cmdIngest(cfg Config, src, key string) error {
 
 // ingestStream stages r into the disk buffer, records the object, and
 // queues it for tape. Shared by the CLI and the S3 PutObject path.
-func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool string) (*Object, error) {
+// owner 0 = system (CLI); S3 passes the uploading user.
+func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool string, owner int64) (*Object, error) {
 	if err := os.MkdirAll(cfg.BufferDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -173,7 +182,7 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool 
 		os.Remove(dst)
 		return nil, err
 	}
-	obj, err := insertObject(db, bucket, key, size, hex.EncodeToString(h.Sum(nil)), dst)
+	obj, err := insertObject(db, bucket, key, size, hex.EncodeToString(h.Sum(nil)), dst, owner)
 	if err != nil {
 		os.Remove(dst)
 		return nil, err
@@ -347,6 +356,7 @@ func LoadConfig() (Config, error) {
 		ChangerDev:  os.Getenv("TAPEBERG_CHANGER_DEV"),
 		AckDir:      envDefault("TAPEBERG_ACK_DIR", "/run/tapeberg"),
 		Pool:        envDefault("TAPEBERG_POOL", "default"),
+		Auth:        envDefault("TAPEBERG_AUTH", "builtin"),
 		S3Listen:    envDefault("TAPEBERG_S3_LISTEN", ":7333"),
 		S3Key:       os.Getenv("TAPEBERG_S3_KEY"),
 		S3Secret:    os.Getenv("TAPEBERG_S3_SECRET"),
@@ -381,4 +391,164 @@ func runAck(what string) error {
 	}
 	fmt.Printf("acknowledged %q — the waiting worker will continue\n", what)
 	return nil
+}
+
+// ---- user / key management (RGW-style; the builtin auth backend) ----
+
+func flagValue(args []string, name string) (string, bool) {
+	for i, a := range args {
+		if a == name && i+1 < len(args) {
+			return args[i+1], true
+		}
+		if strings.HasPrefix(a, name+"=") {
+			return strings.TrimPrefix(a, name+"="), true
+		}
+	}
+	return "", false
+}
+
+func hasFlag(args []string, name string) bool {
+	for _, a := range args {
+		if a == name || strings.HasPrefix(a, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func cmdUser(cfg Config, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: tapeberg user add <uid> [--full-name X] [--email Y] [--admin] | rm <uid> | ls | info <uid> | suspend <uid> | unsuspend <uid>")
+	}
+	db, err := openDB(cfg.DBURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "add":
+		if len(rest) < 1 {
+			return fmt.Errorf("usage: tapeberg user add <uid> [--full-name X] [--email Y] [--admin]")
+		}
+		uid := rest[0]
+		fullName, _ := flagValue(rest, "--full-name")
+		if fullName == "" {
+			fullName = uid
+		}
+		email, _ := flagValue(rest, "--email")
+		if exists, _ := dbUserExists(db, uid); exists {
+			return fmt.Errorf("user %q already exists", uid)
+		}
+		if err := dbUserAdd(db, uid, fullName, email, hasFlag(rest, "--admin")); err != nil {
+			return err
+		}
+		access, secret, err := dbKeyAdd(db, uid)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("user %s created (full name: %s, email: %s, admin: %v)\n", uid, fullName, email, hasFlag(rest, "--admin"))
+		fmt.Printf("access_key: %s\nsecret_key: %s\n", access, secret)
+		fmt.Println("note: the endpoint switches from the static/env key to DB users as soon as one user exists")
+		return nil
+	case "rm":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: tapeberg user rm <uid>")
+		}
+		if err := dbUserRm(db, rest[0]); err != nil {
+			return err
+		}
+		fmt.Printf("user %s removed (their keys are gone; their objects remain, owner-orphaned)\n", rest[0])
+		return nil
+	case "ls":
+		users, err := dbUserList(db)
+		if err != nil {
+			return err
+		}
+		if len(users) == 0 {
+			fmt.Println("no users (endpoint uses the static/env key, or unsigned dev mode)")
+			return nil
+		}
+		for _, u := range users {
+			admin := ""
+			if u.IsAdmin {
+				admin = " [admin]"
+			}
+			susp := ""
+			if u.Suspended {
+				susp = " [suspended]"
+			}
+			fmt.Printf("%s\t%s\t%s\t%d key(s)%s%s\n", u.UID, u.FullName, u.Email, u.Keys, admin, susp)
+		}
+		return nil
+	case "info":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: tapeberg user info <uid>")
+		}
+		u, err := dbUserGet(db, rest[0])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("uid: %s\nfull name: %s\nemail: %s\nadmin: %v\nsuspended: %v\nkeys: %d\n",
+			u.UID, u.FullName, u.Email, u.IsAdmin, u.Suspended, u.Keys)
+		keys, err := dbUserKeys(db, u.UID)
+		if err != nil {
+			return err
+		}
+		for _, k := range keys {
+			fmt.Printf("access_key: %s\nsecret_key: %s\n", k.Access, k.Secret)
+		}
+		return nil
+	case "suspend", "unsuspend":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: tapeberg user %s <uid>", sub)
+		}
+		if err := dbUserSetSuspended(db, rest[0], sub == "suspend"); err != nil {
+			return err
+		}
+		verb := "suspended"
+		if sub == "unsuspend" {
+			verb = "unsuspended"
+		}
+		fmt.Printf("user %s %s\n", rest[0], verb)
+		return nil
+	default:
+		return fmt.Errorf("unknown user subcommand %q (have: add rm ls info suspend unsuspend)", sub)
+	}
+}
+
+func cmdKey(cfg Config, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: tapeberg key add --uid <uid> | rm --access-key <key>")
+	}
+	db, err := openDB(cfg.DBURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	switch args[0] {
+	case "add":
+		uid, ok := flagValue(args, "--uid")
+		if !ok {
+			return fmt.Errorf("usage: tapeberg key add --uid <uid>")
+		}
+		access, secret, err := dbKeyAdd(db, uid)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("access_key: %s\nsecret_key: %s\n", access, secret)
+		return nil
+	case "rm":
+		access, ok := flagValue(args, "--access-key")
+		if !ok {
+			return fmt.Errorf("usage: tapeberg key rm --access-key <key>")
+		}
+		if err := dbKeyRm(db, access); err != nil {
+			return err
+		}
+		fmt.Printf("key %s removed\n", access)
+		return nil
+	default:
+		return fmt.Errorf("unknown key subcommand %q (have: add rm)", args[0])
+	}
 }

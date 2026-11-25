@@ -17,6 +17,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
@@ -48,22 +49,27 @@ func cmdS3Serve(cfg Config, listen string) error {
 	if listen == "" {
 		listen = ":7333"
 	}
-	if cfg.S3Key == "" || cfg.S3Secret == "" {
-		fmt.Fprintln(os.Stderr, "s3: WARNING — no TAPEBERG_S3_KEY/SECRET set; running in UNSIGNED dev mode")
-	}
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	s := &s3srv{cfg: cfg, db: db}
-	fmt.Printf("tapeberg s3: listening on %s (path-style, bucket-in-path)\n", listen)
+	auth, err := NewAuthenticator(cfg, db)
+	if err != nil {
+		return err
+	}
+	s := &s3srv{cfg: cfg, db: db, auth: auth}
+	if !auth.Enabled() {
+		fmt.Fprintln(os.Stderr, "s3: WARNING — no users and no TAPEBERG_S3_KEY/SECRET; running in UNSIGNED dev mode")
+	}
+	fmt.Printf("tapeberg s3: listening on %s (path-style, bucket-in-path, auth=%s)\n", listen, auth.Name())
 	return http.ListenAndServe(listen, s)
 }
 
 type s3srv struct {
-	cfg Config
-	db  *sql.DB
+	cfg  Config
+	db   *sql.DB
+	auth Authenticator
 }
 
 // ---------------- SigV4 ----------------
@@ -206,20 +212,30 @@ func canonicalRequest(r *http.Request) (string, string) {
 	}, "\n"), payloadHash
 }
 
-// verifySigV4 checks the Authorization header against TAPEBERG_S3_SECRET.
-func (s *s3srv) verifySigV4(r *http.Request) error {
-	if s.cfg.S3Key == "" {
-		return nil // unsigned dev mode
+// verifySigV4 checks the Authorization header against the configured
+// authenticator (builtin DB users by default; the resolved user's
+// secret signs the request). Auth is pluggable: LDAP and AD will
+// implement the same interface.
+func (s *s3srv) verifySigV4(r *http.Request) (AuthUser, error) {
+	if !s.auth.Enabled() {
+		return AuthUser{UserID: "anonymous", IsAdmin: true}, nil // unsigned dev mode
 	}
 	auth, ok := parseSigV4(r.Header.Get("Authorization"))
 	if !ok {
-		return errS3("AccessDenied", "missing AWS SigV4 Authorization header", http.StatusForbidden)
+		return AuthUser{}, errS3("AccessDenied", "missing AWS SigV4 Authorization header", http.StatusForbidden)
 	}
-	if auth.accessKey != s.cfg.S3Key {
-		return errS3("InvalidAccessKeyId", "unknown access key", http.StatusForbidden)
+	secret, user, aerr := s.auth.LookupSecret(auth.accessKey)
+	if errors.Is(aerr, ErrUnknownAccessKey) {
+		return AuthUser{}, errS3("InvalidAccessKeyId", "unknown access key", http.StatusForbidden)
+	}
+	if aerr != nil {
+		return AuthUser{}, aerr
+	}
+	if user.Suspended {
+		return AuthUser{}, errS3("AccessDenied", "user "+user.UserID+" is suspended", http.StatusForbidden)
 	}
 	if auth.service != "s3" {
-		return errS3("AccessDenied", "credential scope is not for s3", http.StatusForbidden)
+		return AuthUser{}, errS3("AccessDenied", "credential scope is not for s3", http.StatusForbidden)
 	}
 	// Rebuild the canonical request using the client's signed-headers list.
 	headers := map[string]string{"host": r.Host}
@@ -248,7 +264,7 @@ func (s *s3srv) verifySigV4(r *http.Request) error {
 	}, "\n")
 	scope := strings.Join([]string{auth.date, auth.region, auth.service, "aws4_request"}, "/")
 	sts := "AWS4-HMAC-SHA256\n" + r.Header.Get("x-amz-date") + "\n" + scope + "\n" + sha256Hex([]byte(cr))
-	kDate := hmacSHA256([]byte("AWS4"+s.cfg.S3Secret), auth.date)
+	kDate := hmacSHA256([]byte("AWS4"+secret), auth.date)
 	kRegion := hmacSHA256(kDate, auth.region)
 	kService := hmacSHA256(kRegion, auth.service)
 	kSigning := hmacSHA256(kService, "aws4_request")
@@ -257,9 +273,9 @@ func (s *s3srv) verifySigV4(r *http.Request) error {
 		if os.Getenv("TAPEBERG_S3_DEBUG") != "" {
 			fmt.Fprintf(os.Stderr, "SIGV4 MISMATCH\n--- canonical request ---\n%s\n--- string to sign ---\n%s\n--- got %s want %s\n", cr, sts, auth.signature, want)
 		}
-		return errS3("SignatureDoesNotMatch", "signature mismatch", http.StatusForbidden)
+		return AuthUser{}, errS3("SignatureDoesNotMatch", "signature mismatch", http.StatusForbidden)
 	}
-	return nil
+	return user, nil
 }
 
 // ---------------- XML shapes ----------------
@@ -339,15 +355,45 @@ type restoreRequestXML struct {
 
 // ---------------- handlers ----------------
 
+type userCtxKey struct{}
+
+// resolveUser verifies the request and returns the caller. When auth
+// is disabled (unsigned dev mode) the caller is an omniscient
+// "anonymous" admin — the single-user homelab bootstrap.
+func (s *s3srv) resolveUser(r *http.Request) (AuthUser, error) {
+	if !s.auth.Enabled() {
+		return AuthUser{UserID: "anonymous", IsAdmin: true}, nil
+	}
+	u, err := s.verifySigV4(r)
+	if err != nil {
+		return u, err
+	}
+	return u, nil
+}
+
+func (s *s3srv) user(r *http.Request) AuthUser {
+	if u, ok := r.Context().Value(userCtxKey{}).(AuthUser); ok {
+		return u
+	}
+	return AuthUser{UserID: "anonymous", IsAdmin: true}
+}
+
+// canSee reports whether the caller may access an owned row (object or
+// bucket). Owner 0 = system (CLI ingests, legacy rows): admin-only.
+func canSee(u AuthUser, owner int64) bool {
+	return u.IsAdmin || owner == u.ID
+}
+
 func (s *s3srv) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := s.verifySigV4(r); err != nil {
+	u, err := s.resolveUser(r)
+	if err != nil {
 		writeS3Error(w, err)
 		return
 	}
+	r = r.WithContext(context.WithValue(r.Context(), userCtxKey{}, u))
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	bucket, key, _ := strings.Cut(path, "/")
 
-	var err error
 	switch {
 	case bucket == "":
 		err = s.serveRoot(w, r)
@@ -365,11 +411,11 @@ func (s *s3srv) serveRoot(w http.ResponseWriter, r *http.Request) error {
 	if r.Method != http.MethodGet {
 		return errS3("MethodNotAllowed", "operation not supported", http.StatusMethodNotAllowed)
 	}
-	rows, err := listBuckets(s.db)
+	rows, err := listBucketsFor(s.db, s.user(r))
 	if err != nil {
 		return err
 	}
-	out := listBucketsXML{Xmlns: s3XMLNS, Owner: ownerXML{ID: "tapeberg", DisplayName: "tapeberg"}}
+	out := listBucketsXML{Xmlns: s3XMLNS, Owner: ownerXML{ID: s.user(r).UserID, DisplayName: s.user(r).FullName}}
 	for _, b := range rows {
 		out.Buckets = append(out.Buckets, bucketXML{Name: b.Name, CreationDate: b.Created.Format(time.RFC3339)})
 	}
@@ -381,26 +427,40 @@ func (s *s3srv) serveBucket(w http.ResponseWriter, r *http.Request, bucket strin
 	switch r.Method {
 	case http.MethodPut:
 		// CreateBucket: the bucket binds to this server's tape pool —
-		// pool = tape set, so the S3 namespace mirrors the pools.
-		if err := createBucketIfAbsent(s.db, bucket, s.cfg.Pool); err != nil {
+		// pool = tape set, so the S3 namespace mirrors the pools — and
+		// to the creating user (tenancy: non-admins see only their own).
+		u := s.user(r)
+		if owner, err := bucketOwner(s.db, bucket); err == nil && !canSee(u, owner) {
+			return errS3("BucketAlreadyExists", "bucket exists and is not yours", http.StatusConflict)
+		}
+		if err := createBucketIfAbsent(s.db, bucket, s.cfg.Pool, u.ID); err != nil {
 			return err
 		}
 		w.Header().Set("Location", "/"+bucket)
 		w.WriteHeader(http.StatusOK)
 		return nil
 	case http.MethodHead:
-		if _, err := bucketIDByName(s.db, bucket); err != nil {
+		owner, err := bucketOwner(s.db, bucket)
+		if err != nil || !canSee(s.user(r), owner) {
 			return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 		}
 		w.WriteHeader(http.StatusOK)
 		return nil
 	case http.MethodGet:
 		if r.URL.Query().Has("location") {
+			owner, err := bucketOwner(s.db, bucket)
+			if err != nil || !canSee(s.user(r), owner) {
+				return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+			}
 			w.Header().Set("Content-Type", "application/xml")
 			fmt.Fprintf(w, `<LocationConstraint xmlns=%q>us-east-1</LocationConstraint>`, s3XMLNS)
 			return nil
 		}
-		objs, err := listObjects(s.db, bucket, r.URL.Query().Get("prefix"))
+		owner, err := bucketOwner(s.db, bucket)
+		if err != nil || !canSee(s.user(r), owner) {
+			return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+		}
+		objs, err := listObjectsFor(s.db, bucket, r.URL.Query().Get("prefix"), s.user(r))
 		if err != nil {
 			return err
 		}
@@ -448,7 +508,9 @@ func (s *s3srv) serveObject(w http.ResponseWriter, r *http.Request, bucket, key 
 }
 
 func (s *s3srv) putObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	if _, err := bucketIDByName(s.db, bucket); err != nil {
+	u := s.user(r)
+	owner, err := bucketOwner(s.db, bucket)
+	if err != nil || !canSee(u, owner) {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
 	// The bucket's bound pool decides which tape set archives this object.
@@ -456,7 +518,7 @@ func (s *s3srv) putObject(w http.ResponseWriter, r *http.Request, bucket, key st
 	if err != nil {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
-	obj, err := ingestStream(s.db, s.cfg, bucket, key, requestBody(r), pool)
+	obj, err := ingestStream(s.db, s.cfg, bucket, key, requestBody(r), pool, u.ID)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
@@ -491,6 +553,10 @@ func (s *s3srv) getObject(w http.ResponseWriter, r *http.Request, bucket, key st
 	obj, err := getObjectIn(s.db, bucket, key)
 	if err != nil {
 		return errS3("NoSuchKey", "key does not exist", http.StatusNotFound)
+	}
+	// Tenancy: only the owner or an admin reads an object.
+	if !canSee(s.user(r), obj.OwnerID) {
+		return errS3("AccessDenied", "access denied", http.StatusForbidden)
 	}
 	// Multipart: merge at the API layer — the parts concatenate in
 	// order (Range requests included, via the concat seek reader).
@@ -587,6 +653,9 @@ func (s *s3srv) restoreObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	obj, err := getObjectIn(s.db, bucket, key)
 	if err != nil {
 		return errS3("NoSuchKey", "key does not exist", http.StatusNotFound)
+	}
+	if !canSee(s.user(r), obj.OwnerID) {
+		return errS3("AccessDenied", "access denied", http.StatusForbidden)
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -711,7 +780,7 @@ func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket
 		return err
 	}
 	uploadID := hex.EncodeToString(raw)
-	if err := createUpload(s.db, bucket, key, uploadID); err != nil {
+	if err := createUpload(s.db, bucket, key, uploadID, s.user(r).ID); err != nil {
 		return err
 	}
 	w.Header().Set("Content-Type", "application/xml")
@@ -732,9 +801,12 @@ func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key stri
 	if err != nil || part < 1 || part > 10000 {
 		return errS3("InvalidArgument", "partNumber must be 1-10000", http.StatusBadRequest)
 	}
-	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	if !canSee(s.user(r), owner) {
+		return errS3("AccessDenied", "access denied", http.StatusForbidden)
 	}
 	if err := os.MkdirAll(s.cfg.BufferDir, 0o755); err != nil {
 		return err
@@ -793,9 +865,12 @@ type completeMultipartResult struct {
 
 func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	uploadID := r.URL.Query().Get("uploadId")
-	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	if !canSee(s.user(r), owner) {
+		return errS3("AccessDenied", "access denied", http.StatusForbidden)
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
@@ -887,9 +962,12 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 
 func (s *s3srv) abortMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	uploadID := r.URL.Query().Get("uploadId")
-	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	if !canSee(s.user(r), owner) {
+		return errS3("AccessDenied", "access denied", http.StatusForbidden)
 	}
 	// Parts already written to tape become dead space (v0 has no
 	// reclamation); every catalog trace goes away.
@@ -928,9 +1006,12 @@ type listPartsResult struct {
 
 func (s *s3srv) listUploadParts(w http.ResponseWriter, r *http.Request, bucket, key string) error {
 	uploadID := r.URL.Query().Get("uploadId")
-	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	objID, owner, err := objectByUpload(s.db, bucket, key, uploadID)
 	if err != nil {
 		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	if !canSee(s.user(r), owner) {
+		return errS3("AccessDenied", "access denied", http.StatusForbidden)
 	}
 	parts, err := listParts(s.db, objID)
 	if err != nil {
