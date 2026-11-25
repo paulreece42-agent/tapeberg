@@ -21,12 +21,15 @@ type Config struct {
 	ChangerMode string
 	ChangerDev  string
 	AckDir      string
+	S3Listen    string
+	S3Key       string
+	S3Secret    string
 }
 
 func newChanger(cfg Config) (Changer, error) {
 	switch cfg.ChangerMode {
 	case "manual":
-		return &ManualChanger{AckDir: cfg.AckDir, Drive: cfg.Drive}, nil
+		return &ManualChanger{AckDir: cfg.AckDir, Drive: cfg.Drive, Notify: NewNotifierFromEnv()}, nil
 	case "robot":
 		return NewRobotChanger(cfg.ChangerDev)
 	}

@@ -33,28 +33,79 @@ type Object struct {
 	SHA256       string
 	StorageClass string
 	DiskPath     string // "" when tape-only
+	CreatedAt    time.Time
 }
 
-func bucketID(db *sql.DB) (int64, error) {
+func bucketID(db *sql.DB) (int64, error) { return bucketIDByName(db, "tapeberg") }
+
+func bucketIDByName(db *sql.DB, name string) (int64, error) {
 	var id int64
-	err := db.QueryRow(`SELECT id FROM buckets WHERE name = 'tapeberg'`).Scan(&id)
+	err := db.QueryRow(`SELECT id FROM buckets WHERE name = $1`, name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("bucket 'tapeberg' missing — apply db/seed.sql: %w", ErrNotFound)
+		return 0, fmt.Errorf("bucket %q: %w", name, ErrNotFound)
 	}
 	return id, err
 }
 
-func getObject(db *sql.DB, key string) (*Object, error) {
-	bid, err := bucketID(db)
+func createBucketIfAbsent(db *sql.DB, name string) error {
+	_, err := db.Exec(`INSERT INTO buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, name)
+	return err
+}
+
+type BucketRow struct {
+	Name    string
+	Created time.Time
+}
+
+func listBuckets(db *sql.DB) ([]BucketRow, error) {
+	rows, err := db.Query(`SELECT name, created_at FROM buckets ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BucketRow
+	for rows.Next() {
+		var b BucketRow
+		if err := rows.Scan(&b.Name, &b.Created); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func listObjects(db *sql.DB, bucket, prefix string) ([]Object, error) {
+	rows, err := db.Query(`
+		SELECT o.id, o.key, o.size_bytes, COALESCE(o.sha256,''), o.storage_class, COALESCE(o.disk_path,''), o.created_at
+		FROM objects o JOIN buckets b ON b.id = o.bucket_id
+		WHERE b.name = $1 AND ($2 = '' OR o.key LIKE $2 || '%')
+		ORDER BY o.key`, bucket, prefix)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Object
+	for rows.Next() {
+		var o Object
+		if err := rows.Scan(&o.ID, &o.Key, &o.Size, &o.SHA256, &o.StorageClass, &o.DiskPath, &o.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+func getObjectIn(db *sql.DB, bucket, key string) (*Object, error) {
+	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
 		return nil, err
 	}
 	o := &Object{Key: key}
 	var sha, path sql.NullString
 	err = db.QueryRow(`
-		SELECT id, size_bytes, sha256, storage_class, disk_path
+		SELECT id, size_bytes, sha256, storage_class, disk_path, created_at
 		FROM objects WHERE bucket_id = $1 AND key = $2`, bid, key).
-		Scan(&o.ID, &o.Size, &sha, &o.StorageClass, &path)
+		Scan(&o.ID, &o.Size, &sha, &o.StorageClass, &path, &o.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("object %q: %w", key, ErrNotFound)
 	}
@@ -65,9 +116,29 @@ func getObject(db *sql.DB, key string) (*Object, error) {
 	return o, nil
 }
 
+// activeRetrieve reports the newest non-terminal restore request for an
+// object, so HEAD/GET can surface x-amz-restore state.
+func activeRetrieve(db *sql.DB, objectID int64) (state string, expires time.Time, found bool, err error) {
+	var exp sql.NullTime
+	err = db.QueryRow(`
+		SELECT state, expires_at FROM retrieve_requests
+		WHERE object_id = $1 AND state IN ('pending','waiting_for_media','restoring','restored')
+		ORDER BY id DESC LIMIT 1`, objectID).Scan(&state, &exp)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	if exp.Valid {
+		expires = exp.Time
+	}
+	return state, expires, true, nil
+}
+
 // insertObject records an already-staged disk copy as a STANDARD object.
-func insertObject(db *sql.DB, key string, size int64, sha256hex, diskPath string) (*Object, error) {
-	bid, err := bucketID(db)
+func insertObject(db *sql.DB, bucket, key string, size int64, sha256hex, diskPath string) (*Object, error) {
+	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
 		return nil, err
 	}

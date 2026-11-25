@@ -90,6 +90,13 @@ at most ~1.7 GB). Bump to 1500000 to emulate real LTO-5 (1.5 TB).
   `tape` group won't show up until the daemon restarts. Use
   `sudo -u <user>` (which builds fresh supplementary groups from the
   group DB) to run rig commands with new memberships.
+- **Catalog and media must be reset together in tests.** Deleting
+  `tape_files`/`objects` rows without erasing the physical media leaves
+  the catalog's filemark placement out of sync with the tape — a later
+  archive gets a new physical filemark index while the catalog reuses a
+  freed one, and restores read the WRONG bytes (caught as a checksum
+  mismatch). Test resets erase media (`mt erase`) and reset tape rows
+  in the same step.
 - **`/dev/sgN` numbering shuffles across mhvtl restarts** (changer and
   drive swapped sg2/sg3 after one restart). Never hardcode sgN —
   discover via `lsscsi -g` at runtime, or address the changer via the

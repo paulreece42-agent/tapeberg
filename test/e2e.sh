@@ -78,8 +78,8 @@ n2=$($PSQL -c "SELECT count(*) FROM tape_files tf JOIN tapes t ON t.id=tf.tape_i
 [ "$n2" = 1 ] || fail "expected 1 object on TB0002L5, got $n2"
 s=$($PSQL -c "SELECT state FROM tapes WHERE barcode='TB0001L5'")
 [ "$s" = full ] || fail "TB0001L5 should be state=full after EOM, got '$s'"
-w=$($PSQL -c "SELECT count(*) FROM archive_requests WHERE state='written'")
-[ "$w" = 5 ] || fail "expected 5 written requests, got $w"
+w=$($PSQL -c "SELECT count(*) FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE r.state='written' AND o.key LIKE 'e2e-%'")
+[ "$w" = 5 ] || fail "expected 5 written e2e requests, got $w"
 g=$($PSQL -c "SELECT count(*) FROM objects WHERE storage_class='GLACIER'")
 [ "$g" = 5 ] || fail "expected 5 GLACIER objects, got $g"
 [ ! -e "$TAPEBERG_BUFFER/e2e-file1" ] || fail "disk copies should be dropped after archive"
