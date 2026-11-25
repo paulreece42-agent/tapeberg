@@ -118,7 +118,7 @@ func listObjectsFor(db *sql.DB, bucket, prefix string, u AuthUser) ([]Object, er
 		       COALESCE(o.disk_path,''), o.created_at
 		FROM objects o JOIN buckets b ON b.id = o.bucket_id
 		WHERE b.name = $1 AND ($2 = '' OR o.key LIKE $2 || '%')
-		  AND o.upload_id IS NULL`
+		  AND o.upload_id IS NULL AND o.deleted_at IS NULL`
 	args := []interface{}{bucket, prefix}
 	if !u.IsAdmin {
 		q += ` AND o.owner_id = $3`
@@ -146,6 +146,7 @@ func listObjects(db *sql.DB, bucket, prefix string) ([]Object, error) {
 		SELECT o.id, o.key, o.size_bytes, COALESCE(o.sha256,''), o.storage_class, COALESCE(o.disk_path,''), o.created_at
 		FROM objects o JOIN buckets b ON b.id = o.bucket_id
 		WHERE b.name = $1 AND ($2 = '' OR o.key LIKE $2 || '%') AND o.upload_id IS NULL
+		  AND o.deleted_at IS NULL
 		ORDER BY o.key`, bucket, prefix)
 	if err != nil {
 		return nil, err
@@ -172,7 +173,8 @@ func getObjectIn(db *sql.DB, bucket, key string) (*Object, error) {
 	var owner sql.NullInt64
 	err = db.QueryRow(`
 		SELECT id, size_bytes, sha256, storage_class, disk_path, created_at, owner_id
-		FROM objects WHERE bucket_id = $1 AND key = $2 AND upload_id IS NULL`, bid, key).
+		FROM objects WHERE bucket_id = $1 AND key = $2 AND upload_id IS NULL
+		  AND deleted_at IS NULL`, bid, key).
 		Scan(&o.ID, &o.Size, &sha, &o.StorageClass, &path, &o.CreatedAt, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("object %q: %w", key, ErrNotFound)
@@ -255,7 +257,7 @@ func pendingArchives(db *sql.DB, pool string) ([]ArchiveReq, error) {
 		JOIN objects o ON o.id = r.object_id
 		LEFT JOIN object_parts op
 		  ON op.object_id = r.object_id AND op.part_number = r.part_number
-		WHERE r.state = 'pending' AND r.pool = $1
+		WHERE r.state = 'pending' AND r.pool = $1 AND o.deleted_at IS NULL
 		ORDER BY r.requested_at`, pool)
 	if err != nil {
 		return nil, err
@@ -272,6 +274,22 @@ func pendingArchives(db *sql.DB, pool string) ([]ArchiveReq, error) {
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// pickTapeExcluding is pickTape minus one tape (the repack source).
+func pickTapeExcluding(db *sql.DB, pool string, size int64, exclude int64) (*Tape, error) {
+	q := `SELECT t.id, t.barcode, t.capacity_bytes, t.written_bytes
+		FROM tapes t JOIN tape_pools p ON p.id = t.pool_id
+		WHERE p.name = $2 AND t.state = 'active' AND NOT t.is_cleaning
+		  AND t.id != $3 AND t.written_bytes + $1 <= t.capacity_bytes
+		ORDER BY t.written_bytes DESC, t.id ASC LIMIT 1`
+	t := &Tape{}
+	err := db.QueryRow(q, size, pool, exclude).
+		Scan(&t.ID, &t.Barcode, &t.CapacityBytes, &t.WrittenBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("no active tape in pool %q fits %d bytes", pool, size)
+	}
+	return t, err
 }
 
 type Tape struct {
@@ -332,6 +350,138 @@ func failArchive(db *sql.DB, reqID int64, msg string) error {
 func markTapeFull(db *sql.DB, tapeID int64) error {
 	_, err := db.Exec(`UPDATE tapes SET state='full', updated_at=now() WHERE id=$1`, tapeID)
 	return err
+}
+
+func markTapeRetired(db *sql.DB, tapeID int64) error {
+	_, err := db.Exec(`UPDATE tapes SET state='retired', updated_at=now() WHERE id=$1`, tapeID)
+	return err
+}
+
+// softDeleteObject tombstones the object (delete marker), cancels its
+// queued archive requests, and clears catalog disk references; the
+// caller removes the returned files. Tape bytes stay until the repack
+// pass reclaims them.
+func softDeleteObject(db *sql.DB, objectID int64) (removedFiles []string, err error) {
+	var path sql.NullString
+	err = db.QueryRow(`UPDATE objects SET deleted_at = now(), disk_path = NULL
+		WHERE id = $1 AND deleted_at IS NULL RETURNING disk_path`, objectID).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // already deleted — idempotent
+	}
+	if err != nil {
+		return nil, err
+	}
+	if path.String != "" {
+		removedFiles = append(removedFiles, path.String)
+	}
+	if _, err := db.Exec(`UPDATE archive_requests SET state='cancelled', updated_at=now()
+		WHERE object_id = $1 AND state IN ('pending','assigned')`, objectID); err != nil {
+		return nil, err
+	}
+	// Part disk copies too (multipart buffered or pinned).
+	rows, err := db.Query(`UPDATE object_parts SET disk_path = NULL
+		WHERE object_id = $1 AND disk_path IS NOT NULL RETURNING disk_path`, objectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		removedFiles = append(removedFiles, p)
+	}
+	return removedFiles, rows.Err()
+}
+
+// RepackTape is a tape whose dead (deleted-object) share makes it
+// worth rewriting: live files move to other tapes, the source retires.
+type RepackTape struct {
+	ID      int64
+	Barcode string
+	Written int64
+	Live    int64
+	Dead    int64 // Written - Live
+}
+
+// repackCandidates lists tapes in the pool whose dead bytes meet the
+// threshold (dead >= pct% of written). CTA-style repack.
+func repackCandidates(db *sql.DB, pool string, pct int) ([]RepackTape, error) {
+	rows, err := db.Query(`
+		SELECT t.id, t.barcode, t.written_bytes,
+		       COALESCE(sum(tf.size_bytes) FILTER (
+		         WHERE o.deleted_at IS NULL), 0) AS live
+		FROM tapes t
+		JOIN tape_pools p ON p.id = t.pool_id
+		LEFT JOIN tape_files tf ON tf.tape_id = t.id
+		LEFT JOIN objects o ON o.id = tf.object_id
+		WHERE p.name = $1 AND t.state IN ('active','full') AND t.written_bytes > 0
+		GROUP BY t.id, t.barcode, t.written_bytes
+		HAVING t.written_bytes - COALESCE(sum(tf.size_bytes) FILTER (
+		          WHERE o.deleted_at IS NULL), 0)
+		       >= ($2::numeric / 100.0) * t.written_bytes
+		ORDER BY t.id`, pool, pct)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []RepackTape
+	for rows.Next() {
+		var t RepackTape
+		if err := rows.Scan(&t.ID, &t.Barcode, &t.Written, &t.Live); err != nil {
+			return nil, err
+		}
+		t.Dead = t.Written - t.Live
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// LiveTapeFile is one file to re-archive during repack.
+type LiveTapeFile struct {
+	TapeFileID   int64
+	ObjectID     int64
+	PartNumber   int64
+	PhysicalFile int64
+	Size         int64
+	Sha256       string // object's (or part's) verifier
+}
+
+// liveTapeFiles lists the source tape's live files in write order.
+func liveTapeFiles(db *sql.DB, tapeID int64) ([]LiveTapeFile, error) {
+	rows, err := db.Query(`
+		SELECT tf.id, tf.object_id, tf.part_number, tf.physical_file, tf.size_bytes,
+		       COALESCE(op.sha256, o.sha256)
+		FROM tape_files tf
+		JOIN objects o ON o.id = tf.object_id
+		LEFT JOIN object_parts op
+		  ON op.object_id = tf.object_id AND op.part_number = tf.part_number
+		WHERE tf.tape_id = $1 AND o.deleted_at IS NULL
+		ORDER BY tf.physical_file`, tapeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LiveTapeFile
+	for rows.Next() {
+		var f LiveTapeFile
+		if err := rows.Scan(&f.TapeFileID, &f.ObjectID, &f.PartNumber, &f.PhysicalFile, &f.Size, &f.Sha256); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// moveTapeFile records that a live file now lives at a new position:
+// delete the old placement row, insert the new one. The old bytes
+// become dead space on the source tape (which is being retired).
+func moveTapeFile(db *sql.DB, oldTapeFileID, tapeID, objectID, partNumber, archiveID, physicalFile, size int64) error {
+	if _, err := db.Exec(`DELETE FROM tape_files WHERE id = $1`, oldTapeFileID); err != nil {
+		return err
+	}
+	return insertTapeFile(db, tapeID, objectID, partNumber, archiveID, physicalFile, size)
 }
 
 func addTapeWritten(db *sql.DB, tapeID, n int64) error {

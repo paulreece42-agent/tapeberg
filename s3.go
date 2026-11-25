@@ -496,6 +496,8 @@ func (s *s3srv) serveObject(w http.ResponseWriter, r *http.Request, bucket, key 
 		return s.completeMultipart(w, r, bucket, key)
 	case r.Method == http.MethodDelete && q.Has("uploadId"):
 		return s.abortMultipart(w, r, bucket, key)
+	case r.Method == http.MethodDelete && !q.Has("uploadId"):
+		return s.deleteObject(w, r, bucket, key)
 	case r.Method == http.MethodPut && !q.Has("tagging"):
 		return s.putObject(w, r, bucket, key)
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
@@ -646,6 +648,33 @@ func (s *s3srv) getMultipart(w http.ResponseWriter, r *http.Request, obj *Object
 	defer c.Close()
 	setObjectHeaders(w, obj, st, exp, found)
 	http.ServeContent(w, r, key, obj.CreatedAt, c)
+	return nil
+}
+
+// deleteObject implements S3 DeleteObject as a soft delete: the object
+// is tombstoned (GET/HEAD/list stop seeing it; queued archives are
+// cancelled; disk copies are dropped) and the tape bytes stay until
+// the worker's repack pass reclaims the tape. Idempotent: a missing
+// key also returns 204.
+func (s *s3srv) deleteObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	obj, err := getObjectIn(s.db, bucket, key)
+	if err != nil {
+		w.WriteHeader(http.StatusNoContent) // never existed (or already deleted)
+		return nil
+	}
+	if !canSee(s.user(r), obj.OwnerID) {
+		return errS3("AccessDenied", "access denied", http.StatusForbidden)
+	}
+	files, err := softDeleteObject(s.db, obj.ID)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if f != "" {
+			_ = os.Remove(f)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 	return nil
 }
 

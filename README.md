@@ -68,6 +68,21 @@ users are refused. While no user exists the endpoint keeps the legacy
 behavior (static `TAPEBERG_S3_KEY/SECRET`, or unsigned dev mode) —
 the first created user switches it to real DB auth.
 
+## Deletes & repack (the year-3 problem)
+
+DeleteObject (and `tapeberg rm`) is a **soft delete**: the object gets
+a tombstone in the catalog, GET/HEAD/list stop seeing it, queued
+archives are cancelled — but the tape bytes stay. Tapes are
+write-once, so deletes accumulate as dead space exactly like CTA.
+
+The cron worker reclaims it: when a tape's dead share crosses
+`TAPEBERG_REPACK_THRESHOLD` (default 50%), it **repacks** — every live
+file is read from the source tape (checksum-verified against the
+catalog), re-archived to another tape in the pool, and the emptied
+tape is marked `retired`. A read or checksum failure aborts that
+tape's repack and leaves it untouched — a suspect tape is never
+freed. Erase a retired tape and `tape add` it to reuse the media.
+
 ## S3 (awscli)
 
 Buckets bind to tape pools: CreateBucket binds the serving rig's pool
