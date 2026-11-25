@@ -47,9 +47,24 @@ func bucketIDByName(db *sql.DB, name string) (int64, error) {
 	return id, err
 }
 
-func createBucketIfAbsent(db *sql.DB, name string) error {
-	_, err := db.Exec(`INSERT INTO buckets (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`, name)
+func createBucketIfAbsent(db *sql.DB, name, pool string) error {
+	return insertBucket(db, name, pool)
+}
+
+func insertBucket(db *sql.DB, name, pool string) error {
+	_, err := db.Exec(`INSERT INTO buckets (name, pool) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`, name, pool)
 	return err
+}
+
+// bucketPool reports the tape pool a bucket archives into. The binding
+// is what makes pools visible in the S3 API: bucket = pool = tape set.
+func bucketPool(db *sql.DB, name string) (string, error) {
+	var pool string
+	err := db.QueryRow(`SELECT pool FROM buckets WHERE name = $1`, name).Scan(&pool)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("bucket %q: %w", name, ErrNotFound)
+	}
+	return pool, err
 }
 
 type BucketRow struct {

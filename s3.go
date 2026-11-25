@@ -370,7 +370,9 @@ func (s *s3srv) serveRoot(w http.ResponseWriter, r *http.Request) error {
 func (s *s3srv) serveBucket(w http.ResponseWriter, r *http.Request, bucket string) error {
 	switch r.Method {
 	case http.MethodPut:
-		if err := createBucketIfAbsent(s.db, bucket); err != nil {
+		// CreateBucket: the bucket binds to this server's tape pool —
+		// pool = tape set, so the S3 namespace mirrors the pools.
+		if err := createBucketIfAbsent(s.db, bucket, s.cfg.Pool); err != nil {
 			return err
 		}
 		w.Header().Set("Location", "/"+bucket)
@@ -428,7 +430,12 @@ func (s *s3srv) putObject(w http.ResponseWriter, r *http.Request, bucket, key st
 	if _, err := bucketIDByName(s.db, bucket); err != nil {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
-	obj, err := ingestStream(s.db, s.cfg, bucket, key, r.Body)
+	// The bucket's bound pool decides which tape set archives this object.
+	pool, err := bucketPool(s.db, bucket)
+	if err != nil {
+		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+	}
+	obj, err := ingestStream(s.db, s.cfg, bucket, key, r.Body, pool)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
@@ -531,7 +538,12 @@ func (s *s3srv) restoreObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	if found {
 		return errS3("RestoreAlreadyInProgress", "object restore is already in progress", http.StatusConflict)
 	}
-	if err := createRetrieveRequest(s.db, obj.ID, days, s.cfg.Pool); err != nil {
+	// Restore queues in the bucket's bound pool.
+	pool, err := bucketPool(s.db, bucket)
+	if err != nil {
+		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+	}
+	if err := createRetrieveRequest(s.db, obj.ID, days, pool); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusAccepted)

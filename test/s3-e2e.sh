@@ -56,47 +56,58 @@ UPDATE tapes SET state='active', written_bytes=0 WHERE pool_id=(SELECT id FROM t
 DELETE FROM objects WHERE key LIKE 's3e2e%';" >/dev/null
 
 say "starting the S3 endpoint"
+if ss -ltn 2>/dev/null | grep -q ':7333 '; then
+  fail "port 7333 already in use — a production s3 server? Stop it first; running the test against it would write test data into the real catalog"
+fi
 "$BIN" s3 127.0.0.1:7333 &
 SRV_PID=$!
 for _ in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:7333/ && break; sleep 0.5; done
-curl -s -o /dev/null http://127.0.0.1:7333/ || fail "s3 endpoint did not come up"
+kill -0 $SRV_PID 2>/dev/null || fail "s3 endpoint died at startup"
 
 export AWS_ACCESS_KEY_ID="$TAPEBERG_S3_KEY" AWS_SECRET_ACCESS_KEY="$TAPEBERG_S3_SECRET"
 
+say "create-bucket: binds to this rig's pool (vtl)"
+$AWS s3api create-bucket --bucket vtl || fail "create-bucket failed"
+bp=$($PSQL -c "SELECT pool FROM buckets WHERE name='vtl'")
+[ "$bp" = vtl ] || fail "bucket vtl should be bound to pool vtl, got '$bp'"
+
 say "list-buckets"
-$AWS s3api list-buckets --query "Buckets[].Name" --output text | grep -q tapeberg || fail "bucket not listed"
+$AWS s3api list-buckets --query "Buckets[].Name" --output text | grep -qw vtl || fail "bucket not listed"
 
 say "put-object (5 MiB)"
 dd if=/dev/urandom of="$WORK/obj" bs=1M count=5 status=none
-ETAG=$($AWS s3api put-object --bucket tapeberg --key s3e2e-obj --body "$WORK/obj" --query ETag --output text)
+ETAG=$($AWS s3api put-object --bucket vtl --key s3e2e-obj --body "$WORK/obj" --query ETag --output text)
 [ -n "$ETAG" ] || fail "put-object returned no ETag"
 echo "put ETag: $ETAG"
 sha=$(sha256sum "$WORK/obj" | cut -d' ' -f1)
 [ "$ETAG" = "\"$sha\"" ] || fail "ETag does not match client-side sha256"
 
 say "head-object while disk-buffered (STANDARD)"
-$AWS s3api head-object --bucket tapeberg --key s3e2e-obj > "$WORK/head1.json"
+$AWS s3api head-object --bucket vtl --key s3e2e-obj > "$WORK/head1.json"
 grep -q '"StorageClass"' "$WORK/head1.json" && fail "fresh object should not report a storage class"
 
 say "worker: archive to tape"
 "$BIN" worker
+# The bucket binding must have queued the archive in pool vtl.
+ap=$($PSQL -c "SELECT r.pool FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='s3e2e-obj' ORDER BY r.id DESC LIMIT 1")
+[ "$ap" = vtl ] || fail "archive request should be pool vtl (bucket binding), got '$ap'"
 
 say "head-object after archive (GLACIER)"
-$AWS s3api head-object --bucket tapeberg --key s3e2e-obj > "$WORK/head2.json"
+$AWS s3api head-object --bucket vtl --key s3e2e-obj > "$WORK/head2.json"
 grep -q '"StorageClass": "GLACIER"' "$WORK/head2.json" || fail "archived object should report GLACIER"
 
 say "get-object on tape-only object → InvalidObjectState (Glacier contract)"
-if $AWS s3api get-object --bucket tapeberg --key s3e2e-obj "$WORK/out-early" 2>"$WORK/geterr"; then
+if $AWS s3api get-object --bucket vtl --key s3e2e-obj "$WORK/out-early" 2>"$WORK/geterr"; then
   fail "get-object should have failed on a GLACIER object"
 fi
 grep -q "InvalidObjectState" "$WORK/geterr" || fail "expected InvalidObjectState, got: $(cat "$WORK/geterr")"
 echo "refused with InvalidObjectState as expected"
 
 say "restore-object (Days=2) → 202"
-$AWS s3api restore-object --bucket tapeberg --key s3e2e-obj --restore-request Days=2 || fail "restore-object failed"
+$AWS s3api restore-object --bucket vtl --key s3e2e-obj --restore-request Days=2 || fail "restore-object failed"
 
 say "head-object during restore (ongoing-request=true)"
-$AWS s3api head-object --bucket tapeberg --key s3e2e-obj > "$WORK/head3.json"
+$AWS s3api head-object --bucket vtl --key s3e2e-obj > "$WORK/head3.json"
 python3 - "$WORK/head3.json" <<'PYEOF' || fail "expected x-amz-restore ongoing-request=true"
 import json, sys
 r = json.load(open(sys.argv[1])).get("Restore", "")
@@ -104,7 +115,7 @@ exit(0 if 'ongoing-request="true"' in r else 1)
 PYEOF
 
 say "second restore → RestoreAlreadyInProgress (409)"
-if $AWS s3api restore-object --bucket tapeberg --key s3e2e-obj --restore-request Days=2 2>"$WORK/restoreerr"; then
+if $AWS s3api restore-object --bucket vtl --key s3e2e-obj --restore-request Days=2 2>"$WORK/restoreerr"; then
   echo "note: second restore accepted (200/202) rather than 409"
 else
   grep -q "RestoreAlreadyInProgress" "$WORK/restoreerr" && echo "409 RestoreAlreadyInProgress as expected"
@@ -114,7 +125,7 @@ say "worker: drain the restore"
 "$BIN" worker
 
 say "head-object after restore (ongoing-request=false, expiry)"
-$AWS s3api head-object --bucket tapeberg --key s3e2e-obj > "$WORK/head4.json"
+$AWS s3api head-object --bucket vtl --key s3e2e-obj > "$WORK/head4.json"
 python3 - "$WORK/head4.json" <<'PYEOF' || fail "expected ongoing-request=false with expiry-date after restore"
 import json, sys
 r = json.load(open(sys.argv[1])).get("Restore", "")
@@ -122,11 +133,11 @@ exit(0 if 'ongoing-request="false"' in r and "expiry-date" in r else 1)
 PYEOF
 
 say "get-object restored → byte-identical"
-$AWS s3api get-object --bucket tapeberg --key s3e2e-obj "$WORK/out" >/dev/null || fail "restored get-object failed"
+$AWS s3api get-object --bucket vtl --key s3e2e-obj "$WORK/out" >/dev/null || fail "restored get-object failed"
 cmp "$WORK/obj" "$WORK/out" || fail "restored bytes differ from upload"
 
 say "list-objects-v2"
-$AWS s3api list-objects-v2 --bucket tapeberg --prefix s3e2e --query "Contents[].Key" --output text | grep -q s3e2e-obj || fail "object not listed"
+$AWS s3api list-objects-v2 --bucket vtl --prefix s3e2e --query "Contents[].Key" --output text | grep -q s3e2e-obj || fail "object not listed"
 
 say "SigV4 is enforced (bad signature rejected)"
 if AWS_SECRET_ACCESS_KEY="wrong-secret" $AWS s3api list-buckets >/dev/null 2>&1; then
