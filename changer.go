@@ -97,6 +97,17 @@ func (r *RobotChanger) Unload() error {
 type ManualChanger struct {
 	AckDir string
 	Drive  string
+	Notify *Notifier // optional: ping a human when their hands are needed
+}
+
+// notify pings the human on every configured channel (best effort).
+func (m *ManualChanger) notify(text string) {
+	if m.Notify == nil || !m.Notify.Enabled() {
+		return
+	}
+	if err := m.Notify.Notify(text); err != nil {
+		fmt.Fprintf(os.Stderr, "manual-changer notify: %v\n", err)
+	}
 }
 
 func (m *ManualChanger) writePrompt(text string) error {
@@ -133,6 +144,7 @@ Insert tape %s into the drive, then acknowledge:
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "MANUAL CHANGER: load %s into %s — waiting for 'tapeberg ack %s'\n", barcode, m.Drive, barcode)
+	m.notify(fmt.Sprintf("🧊 Tapeberg: load tape %s into drive %s, then run: tapeberg ack %s", barcode, m.Drive, barcode))
 	return m.waitAck(barcode)
 }
 
@@ -148,5 +160,6 @@ Remove the tape from the drive and put it away, then acknowledge:
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "MANUAL CHANGER: unload %s — waiting for 'tapeberg ack UNLOAD'\n", m.Drive)
+	m.notify(fmt.Sprintf("🧊 Tapeberg: remove the tape from drive %s and put it away, then run: tapeberg ack UNLOAD", m.Drive))
 	return m.waitAck("UNLOAD")
 }

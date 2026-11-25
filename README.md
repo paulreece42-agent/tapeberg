@@ -1,93 +1,61 @@
 # Tapeberg
 
-A personal Glacier on your own tape. Tapeberg puts AWS-Glacier-shaped
-cold-archive semantics in front of your own LTO drives — with an
-autochanger robot when you have one, and **a human as the tape changer
-when you don't**.
+**Work in progress.** Personal AWS-Glacier-style cold archive on your own
+LTO tapes. Go + PostgreSQL + cron. Drives an autochanger robot via `mtx`,
+or runs in **manual mode**: it pings you on Telegram/a webhook — "load
+tape TB0003L5" — and waits for `tapeberg ack`.
 
-```
-ingest → [disk buffer] → worker → tape (LTO) → ...
-                                      ↓
-get ← [disk buffer, pinned N days] ← worker ← restore
-```
-
-## How it behaves
-
-- **ingest** stages a file in the disk buffer and queues it for tape.
-- The **worker** (one-shot, meant for flock'd cron) writes queued files
-  to tape — filling tapes in sequence, handling EOM by marking the tape
-  full and moving on — then drops the disk copy: the object becomes
-  tape-only (`GLACIER`).
-- **restore** queues a Glacier-style job; the worker streams the file
-  back from tape (verifying sha256 against the catalog) and pins the
-  disk copy for N days (1–30, like RestoreObject).
-- **get** refuses tape-only objects with `InvalidObjectState` until
-  they are restored — Glacier's exact contract.
-- A pin-expiry sweep returns lapsed restores to tape-only.
-- **Changer modes:** `robot` drives an autochanger via `mtx` (barcode →
-  slot, auto-discovered via `lsscsi`); `manual` writes a prompt file,
-  pings stderr, and waits until you acknowledge with `tapeberg ack` —
-  insert the tape yourself, single-drive homelab style.
-
-## Quickstart (dev rig)
-
-Requires the mhvtl rig (see `docs/dev-rig.md`), the PostgreSQL catalog
-(`docs/database.md`), and `mtx`/`mt`/`lsscsi` on PATH.
+## Set up
 
 ```sh
 go build -o tapeberg .
-
-export TAPEBERG_DB_URL=...        # postgres://tapeberg:...@127.0.0.1/tapeberg
-export TAPEBERG_DRIVE=/dev/nst1   # non-rewinding device
-export TAPEBERG_BUFFER=/var/lib/tapeberg
-export TAPEBERG_CHANGER=robot     # or: manual
-
-./tapeberg ingest bigfile.tar
-./tapeberg worker
-./tapeberg status
-./tapeberg get bigfile.tar        # → InvalidObjectState (GLACIER)
-./tapeberg restore bigfile.tar 3
-./tapeberg worker
-./tapeberg get bigfile.tar > out.tar   # byte-identical (sha256 verified)
+export TAPEBERG_DB_URL=postgres://...        # catalog (db/migrations/)
+export TAPEBERG_DRIVE=/dev/nst0             # non-rewinding tape device
+export TAPEBERG_BUFFER=/var/lib/tapeberg   # disk staging area
+export TAPEBERG_CHANGER=manual              # or robot (autochanger)
+# notifications (optional, any mix):
+export TAPEBERG_TELEGRAM_TOKEN=... TAPEBERG_TELEGRAM_CHAT=...
+export TAPEBERG_WEBHOOK_URL=...             # POSTs {"text": ...} (Slack incoming-webhook shape)
+tapeberg doctor                             # readiness check
 ```
 
-Run the whole loop against the virtual library with `./test/e2e.sh`
-(includes a forced tape swap + EOM retry, filemark seeks, pin expiry,
-and manual-changer mode).
+Run the worker from cron (see `deploy/tapeberg-worker.cron`). In manual
+mode, label your physical tapes with the catalog barcodes (TB0003L5…).
 
-## Manual-changer mode (the human is the robot arm)
-
-```
-$ tapeberg restore vacation-photos 7
-$ tapeberg worker
-MANUAL CHANGER: load TB0003L5 into /dev/nst0 — waiting for 'tapeberg ack TB0003L5'
-```
-
-Insert the tape, then:
+## CLI
 
 ```sh
-tapeberg ack TB0003L5
-# ... worker restores, then prompts:
-MANUAL CHANGER: unload /dev/nst0 — waiting for 'tapeberg ack UNLOAD'
-tapeberg ack UNLOAD
+tapeberg ingest file.tar          # stage + queue for tape
+tapeberg worker                   # drain archive/restore queues, once
+tapeberg restore file.tar 3       # Glacier restore, pinned 3 days
+tapeberg get file.tar > out       # errors InvalidObjectState until restored
+tapeberg status
+tapeberg ack TB0003L5             # manual changer: "tape is in the drive"
 ```
 
-## Design
+## S3 (awscli)
 
-- **PostgreSQL catalog** owns state; **tape** owns bytes. State machines
-  are TEXT + CHECK. Schema: `db/migrations/` (rationale in
-  `docs/database.md`).
-- **Go** for everything: single binary, `mt` for positioning (st's
-  single-open rule), native chunked I/O on `/dev/nst*` — writes are
-  chunked at 256 KiB because single writes above ~512 KiB fail against
-  the emulated drive (rig-verified, see `docs/dev-rig.md`).
-- Borrowed with credit: CTA's queue/tape-pool scheduling ideas and
-  dCache's pin-as-restore model (`Days=N` maps to an expiry-swept pin).
-- Cron + flock over a long-running daemon (see
-  `deploy/tapeberg-worker.cron`): homelab-honest, restartable, logged.
+```sh
+export TAPEBERG_S3_KEY=... TAPEBERG_S3_SECRET=...
+tapeberg s3                                        # serves :7333, SigV4
+export AWS_ACCESS_KEY_ID=$TAPEBERG_S3_KEY AWS_SECRET_ACCESS_KEY=$TAPEBERG_S3_SECRET
+AWS="aws --endpoint-url http://localhost:7333 --region us-east-1"
+$AWS s3api list-buckets
+$AWS s3api put-object --bucket tapeberg --key foo --body foo
+$AWS s3api head-object --bucket tapeberg --key foo    # StorageClass: GLACIER once archived
+$AWS s3api get-object --bucket tapeberg --key foo f1  # 403 InvalidObjectState
+$AWS s3api restore-object --bucket tapeberg --key foo --restore-request Days=2
+# after a worker pass: get-object succeeds, head-object shows ongoing-request="false"
+```
+
+Multipart upload is not supported yet — use `s3api put-object` (or raise
+awscli's multipart threshold).
 
 ## Status
 
-v0 — proves the core loop end-to-end on a virtual LTO-5 library. Not
-yet: S3 wire protocol, multipart, versioning, repack, drive-native
-ioctls, concurrent workers.
+Works (e2e-tested on an mhvtl LTO-5 rig): ingest → tape → GLACIER →
+restore → pin expiry; EOM retry and tape swaps; the S3 Glacier contract
+via awscli (SigV4, InvalidObjectState, RestoreObject, x-amz-restore);
+manual changer with Telegram/webhook alerts; `doctor`.
+
+Not yet: multipart, DeleteObject, versioning, presigned URLs, repack.

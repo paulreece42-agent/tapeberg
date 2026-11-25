@@ -12,6 +12,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -28,6 +29,8 @@ usage:
   tapeberg get <key>                 cat a restored object to stdout
   tapeberg status                    catalog + queue summary
   tapeberg worker                    drain archive/restore queues once (run from cron)
+  tapeberg s3 [listen-addr]          serve the S3/Glacier wire protocol (default :7333)
+  tapeberg doctor [--notify-test]    readiness check (catalog, drive, changer, notifier)
   tapeberg ack <what>                acknowledge a manual-changer prompt
 `
 
@@ -97,6 +100,19 @@ func run(args []string) error {
 	case "worker":
 		return RunWorker(cfg)
 
+	case "s3":
+		listen := ""
+		if len(rest) > 1 {
+			return fmt.Errorf("usage: tapeberg s3 [listen-addr]")
+		}
+		if len(rest) == 1 {
+			listen = rest[0]
+		}
+		return cmdS3Serve(cfg, listen)
+
+	case "doctor":
+		return cmdDoctor(cfg, rest)
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n%s", cmd, usageText)
 		os.Exit(2)
@@ -111,38 +127,50 @@ func cmdIngest(cfg Config, src, key string) error {
 		return err
 	}
 	defer db.Close()
-
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-
-	if err := os.MkdirAll(cfg.BufferDir, 0o755); err != nil {
-		return err
-	}
-	dst := filepath.Join(cfg.BufferDir, key)
-	out, err := os.Create(dst)
+	obj, err := ingestStream(db, cfg, "tapeberg", key, in)
 	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	h := sha256.New()
-	size, err := io.Copy(io.MultiWriter(out, h), in)
-	if err != nil {
-		return err
-	}
-	obj, err := insertObject(db, key, size, hex.EncodeToString(h.Sum(nil)), dst)
-	if err != nil {
-		os.Remove(dst)
-		return err
-	}
-	if err := createArchiveRequest(db, obj.ID); err != nil {
 		return err
 	}
 	fmt.Printf("ingested %s (%d bytes, sha256 %s) — queued for tape\n", key, obj.Size, obj.SHA256)
 	return nil
+}
+
+// ingestStream stages r into the disk buffer, records the object, and
+// queues it for tape. Shared by the CLI and the S3 PutObject path.
+func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader) (*Object, error) {
+	if err := os.MkdirAll(cfg.BufferDir, 0o755); err != nil {
+		return nil, err
+	}
+	dst := filepath.Join(cfg.BufferDir, key)
+	out, err := os.Create(dst)
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(out, h), r)
+	if err != nil {
+		out.Close()
+		os.Remove(dst)
+		return nil, err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return nil, err
+	}
+	obj, err := insertObject(db, bucket, key, size, hex.EncodeToString(h.Sum(nil)), dst)
+	if err != nil {
+		os.Remove(dst)
+		return nil, err
+	}
+	if err := createArchiveRequest(db, obj.ID); err != nil {
+		return nil, err
+	}
+	return obj, nil
 }
 
 // cmdRestore queues a Glacier-style restore job for the object.
@@ -153,7 +181,7 @@ func cmdRestore(cfg Config, key string, days int) error {
 	}
 	defer db.Close()
 
-	obj, err := getObject(db, key)
+	obj, err := getObjectIn(db, "tapeberg", key)
 	if err != nil {
 		return err
 	}
@@ -177,7 +205,7 @@ func cmdGet(cfg Config, key string) error {
 	}
 	defer db.Close()
 
-	obj, err := getObject(db, key)
+	obj, err := getObjectIn(db, "tapeberg", key)
 	if err != nil {
 		return err
 	}
@@ -220,6 +248,9 @@ func LoadConfig() (Config, error) {
 		ChangerMode: envDefault("TAPEBERG_CHANGER", "robot"),
 		ChangerDev:  os.Getenv("TAPEBERG_CHANGER_DEV"),
 		AckDir:      envDefault("TAPEBERG_ACK_DIR", "/run/tapeberg"),
+		S3Listen:    envDefault("TAPEBERG_S3_LISTEN", ":7333"),
+		S3Key:       os.Getenv("TAPEBERG_S3_KEY"),
+		S3Secret:    os.Getenv("TAPEBERG_S3_SECRET"),
 	}
 	var missing []string
 	if c.DBURL == "" {
