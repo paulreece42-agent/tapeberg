@@ -49,7 +49,12 @@ for bc in TB0001L5 TB0002L5 TB0003L5; do
   mt -f "$DRIVE" rewind
   mtx -f "$CHANGER_DEV" unload >/dev/null
 done
-$PSQL -c "DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 's3e2e%');
+$PSQL -c "DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objects WHERE bucket_id IN (SELECT id FROM buckets WHERE name='alice-bkt'));
+DELETE FROM archive_requests WHERE object_id IN (SELECT id FROM objects WHERE bucket_id IN (SELECT id FROM buckets WHERE name='alice-bkt'));
+DELETE FROM objects WHERE bucket_id IN (SELECT id FROM buckets WHERE name='alice-bkt');
+DELETE FROM buckets WHERE name='alice-bkt';
+DELETE FROM s3_users;
+DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 's3e2e%');
 DELETE FROM archive_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 's3e2e%');
 DELETE FROM tape_files WHERE tape_id IN (SELECT id FROM tapes WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl'));
 UPDATE tapes SET state='active', written_bytes=0 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl');
@@ -208,6 +213,67 @@ if AWS_SECRET_ACCESS_KEY="wrong-secret" $AWS s3api list-buckets >/dev/null 2>&1;
   fail "bad credentials were accepted"
 fi
 echo "bad signature rejected"
+
+say "auth: builtin DB users, tenancy, key rotation (RGW-style)"
+[ "$($PSQL -c "SELECT count(*) FROM s3_users")" = 0 ] || fail "expected no users at this point"
+uout=$("$BIN" user add alice --full-name "Alice Example" --email alice@example.com 2>&1)
+AK=$(echo "$uout" | awk '/^access_key:/{print $2}')
+SK=$(echo "$uout" | awk '/^secret_key:/{print $2}')
+[ -n "$AK" ] && [ -n "$SK" ] || fail "user add printed no keys"
+if $AWS s3api list-buckets >/dev/null 2>&1; then
+  fail "static env key must stop working once DB users exist"
+fi
+export AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK"
+$AWS s3api create-bucket --bucket alice-bkt || fail "alice create-bucket failed"
+$AWS s3api list-buckets --query "Buckets[].Name" --output text | grep -qw alice-bkt || fail "alice's bucket not listed"
+if $AWS s3api list-buckets --query "Buckets[].Name" --output text | grep -qw vtl; then
+  fail "alice must not see the system bucket"
+fi
+echo "tenancy" > "$WORK/hi"
+$AWS s3api put-object --bucket alice-bkt --key alice-hi --body "$WORK/hi" >/dev/null || fail "alice put failed"
+"$BIN" worker >/dev/null || fail "worker failed archiving alice's object"
+$AWS s3api list-objects-v2 --bucket alice-bkt --query "Contents[].Key" --output text | grep -qw alice-hi || fail "alice cannot list her object"
+if $AWS s3api list-objects-v2 --bucket vtl >/dev/null 2>&1; then
+  fail "alice must not list another tenant's bucket"
+fi
+if $AWS s3api get-object --bucket vtl --key s3e2e-obj "$WORK/tx" >/dev/null 2>&1; then
+  fail "alice must not read another tenant's object"
+fi
+
+say "suspend / unsuspend"
+"$BIN" user suspend alice
+if $AWS s3api list-buckets >/dev/null 2>&1; then
+  fail "suspended user must be rejected"
+fi
+"$BIN" user unsuspend alice
+$AWS s3api list-buckets >/dev/null || fail "unsuspend did not restore access"
+
+say "key rotation (multiple keys per user)"
+kout=$("$BIN" key add --uid alice 2>&1)
+AK2=$(echo "$kout" | awk '/^access_key:/{print $2}')
+SK2=$(echo "$kout" | awk '/^secret_key:/{print $2}')
+[ -n "$AK2" ] && [ -n "$SK2" ] || fail "key add printed no keys"
+export AWS_ACCESS_KEY_ID="$AK2" AWS_SECRET_ACCESS_KEY="$SK2"
+$AWS s3api list-buckets >/dev/null || fail "second key must work"
+"$BIN" key rm --access-key "$AK"
+if AWS_ACCESS_KEY_ID="$AK" AWS_SECRET_ACCESS_KEY="$SK" $AWS s3api list-buckets >/dev/null 2>&1; then
+  fail "removed key must be rejected"
+fi
+
+say "admin sees everything"
+aout=$("$BIN" user add siteadmin --full-name "Site Admin" --email admin@example.com --admin 2>&1)
+ADM_AK=$(echo "$aout" | awk '/^access_key:/{print $2}')
+ADM_SK=$(echo "$aout" | awk '/^secret_key:/{print $2}')
+export AWS_ACCESS_KEY_ID="$ADM_AK" AWS_SECRET_ACCESS_KEY="$ADM_SK"
+$AWS s3api list-buckets --query "Buckets[].Name" --output text | grep -qw vtl || fail "admin must see the system bucket"
+$AWS s3api list-objects-v2 --bucket alice-bkt --query "Contents[].Key" --output text | grep -qw alice-hi || fail "admin must see alice's object"
+$AWS s3api get-object --bucket vtl --key s3e2e-obj "$WORK/adminget" >/dev/null || fail "admin cross-tenant get failed"
+
+say "user rm; static key returns"
+"$BIN" user rm alice
+"$BIN" user rm siteadmin
+export AWS_ACCESS_KEY_ID="$TAPEBERG_S3_KEY" AWS_SECRET_ACCESS_KEY="$TAPEBERG_S3_SECRET"
+$AWS s3api list-buckets >/dev/null || fail "static env key must work again once no users exist"
 
 kill $SRV_PID 2>/dev/null || true
 SRV_PID=""

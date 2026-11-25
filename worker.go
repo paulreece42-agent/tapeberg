@@ -23,6 +23,7 @@ type Config struct {
 	ChangerDev  string
 	AckDir      string
 	Pool        string // tape pool this rig draws from (isolation)
+	Auth        string // auth backend: builtin (default), ldap/ad later
 	S3Listen    string
 	S3Key       string
 	S3Secret    string

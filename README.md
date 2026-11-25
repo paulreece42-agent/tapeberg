@@ -47,6 +47,27 @@ tapeberg status
 tapeberg ack TB0003L5             # manual changer: "tape is in the drive"
 ```
 
+## Auth (users, keys, tenancy)
+
+Modeled on Ceph RGW: users carry a uid, full name, email, an admin
+flag, and one or more rotatable access/secret key pairs — all in the
+catalog DB (the `builtin` backend, default; `TAPEBERG_AUTH` selects a
+backend — LDAP/AD drop in later behind the same interface).
+
+```sh
+tapeberg user add paul --full-name "Paul Reece" --email paul@example.com --admin
+tapeberg user ls
+tapeberg key add --uid paul           # rotation: second key, then remove the old
+tapeberg key rm --access-key <old>
+tapeberg user suspend paul
+```
+
+Tenancy: non-admin users see only their own buckets and objects
+(CLI-ingested objects are system-owned, admin-visible). Suspended
+users are refused. While no user exists the endpoint keeps the legacy
+behavior (static `TAPEBERG_S3_KEY/SECRET`, or unsigned dev mode) —
+the first created user switches it to real DB auth.
+
 ## S3 (awscli)
 
 Buckets bind to tape pools: CreateBucket binds the serving rig's pool

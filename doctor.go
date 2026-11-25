@@ -39,7 +39,22 @@ func cmdDoctor(cfg Config, args []string) error {
 		}
 	}
 
-	// 2. Drive
+	// 2. Auth backend: who may talk to the S3 endpoint.
+	var users int
+	if err := db.QueryRow(`SELECT count(*) FROM s3_users`).Scan(&users); err == nil {
+		switch {
+		case users > 0:
+			fmt.Printf("✓ auth: %s (%d user(s) in catalog; static env key inactive)\n", cfg.Auth, users)
+		case cfg.S3Key != "":
+			fmt.Printf("△ auth: no users — using the static TAPEBERG_S3_KEY (create one: tapeberg user add <uid> --full-name X --email Y)\n")
+		default:
+			fmt.Printf("△ auth: UNSIGNED dev mode — anyone reaching the S3 port can read/write\n")
+		}
+	} else {
+		fmt.Printf("△ auth: %s backend has no user table yet (apply db/migrations)\n", cfg.Auth)
+	}
+
+	// 3. Drive
 	if _, err := os.Stat(cfg.Drive); err != nil {
 		fail("drive: %s not present: %v", cfg.Drive, err)
 	} else {

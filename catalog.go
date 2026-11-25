@@ -33,6 +33,7 @@ type Object struct {
 	SHA256       string
 	StorageClass string
 	DiskPath     string // "" when tape-only
+	OwnerID      int64  // 0 = system (CLI ingests, legacy rows)
 	CreatedAt    time.Time
 }
 
@@ -47,13 +48,24 @@ func bucketIDByName(db *sql.DB, name string) (int64, error) {
 	return id, err
 }
 
-func createBucketIfAbsent(db *sql.DB, name, pool string) error {
-	return insertBucket(db, name, pool)
+func createBucketIfAbsent(db *sql.DB, name, pool string, owner int64) error {
+	return insertBucket(db, name, pool, owner)
 }
 
-func insertBucket(db *sql.DB, name, pool string) error {
-	_, err := db.Exec(`INSERT INTO buckets (name, pool) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING`, name, pool)
+func insertBucket(db *sql.DB, name, pool string, owner int64) error {
+	_, err := db.Exec(`INSERT INTO buckets (name, pool, owner_id) VALUES ($1, $2, NULLIF($3,0))
+		ON CONFLICT (name) DO NOTHING`, name, pool, owner)
 	return err
+}
+
+// bucketOwner reports the bucket's owner (0 = system-owned).
+func bucketOwner(db *sql.DB, name string) (int64, error) {
+	var o sql.NullInt64
+	err := db.QueryRow(`SELECT owner_id FROM buckets WHERE name = $1`, name).Scan(&o)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, fmt.Errorf("bucket %q: %w", name, ErrNotFound)
+	}
+	return o.Int64, err
 }
 
 // bucketPool reports the tape pool a bucket archives into. The binding
@@ -72,8 +84,18 @@ type BucketRow struct {
 	Created time.Time
 }
 
-func listBuckets(db *sql.DB) ([]BucketRow, error) {
-	rows, err := db.Query(`SELECT name, created_at FROM buckets ORDER BY name`)
+// listBucketsFor scopes bucket visibility: admins see all buckets,
+// users only their own (system-owned buckets are admin-only, like
+// CLI-ingested objects).
+func listBucketsFor(db *sql.DB, u AuthUser) ([]BucketRow, error) {
+	q := `SELECT name, created_at FROM buckets`
+	args := []interface{}{}
+	if !u.IsAdmin {
+		q += ` WHERE owner_id = $1`
+		args = append(args, u.ID)
+	}
+	q += ` ORDER BY name`
+	rows, err := db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +107,36 @@ func listBuckets(db *sql.DB) ([]BucketRow, error) {
 			return nil, err
 		}
 		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// listObjectsFor scopes object listing the same way.
+func listObjectsFor(db *sql.DB, bucket, prefix string, u AuthUser) ([]Object, error) {
+	q := `
+		SELECT o.id, o.key, o.size_bytes, COALESCE(o.sha256,''), o.storage_class,
+		       COALESCE(o.disk_path,''), o.created_at
+		FROM objects o JOIN buckets b ON b.id = o.bucket_id
+		WHERE b.name = $1 AND ($2 = '' OR o.key LIKE $2 || '%')
+		  AND o.upload_id IS NULL`
+	args := []interface{}{bucket, prefix}
+	if !u.IsAdmin {
+		q += ` AND o.owner_id = $3`
+		args = append(args, u.ID)
+	}
+	q += ` ORDER BY o.key`
+	rows, err := db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Object
+	for rows.Next() {
+		var o Object
+		if err := rows.Scan(&o.ID, &o.Key, &o.Size, &o.SHA256, &o.StorageClass, &o.DiskPath, &o.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
 	}
 	return out, rows.Err()
 }
@@ -117,17 +169,18 @@ func getObjectIn(db *sql.DB, bucket, key string) (*Object, error) {
 	}
 	o := &Object{Key: key}
 	var sha, path sql.NullString
+	var owner sql.NullInt64
 	err = db.QueryRow(`
-		SELECT id, size_bytes, sha256, storage_class, disk_path, created_at
+		SELECT id, size_bytes, sha256, storage_class, disk_path, created_at, owner_id
 		FROM objects WHERE bucket_id = $1 AND key = $2 AND upload_id IS NULL`, bid, key).
-		Scan(&o.ID, &o.Size, &sha, &o.StorageClass, &path, &o.CreatedAt)
+		Scan(&o.ID, &o.Size, &sha, &o.StorageClass, &path, &o.CreatedAt, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("object %q: %w", key, ErrNotFound)
 	}
 	if err != nil {
 		return nil, err
 	}
-	o.SHA256, o.DiskPath = sha.String, path.String
+	o.SHA256, o.DiskPath, o.OwnerID = sha.String, path.String, owner.Int64
 	return o, nil
 }
 
@@ -152,16 +205,16 @@ func activeRetrieve(db *sql.DB, objectID int64) (state string, expires time.Time
 }
 
 // insertObject records an already-staged disk copy as a STANDARD object.
-func insertObject(db *sql.DB, bucket, key string, size int64, sha256hex, diskPath string) (*Object, error) {
+func insertObject(db *sql.DB, bucket, key string, size int64, sha256hex, diskPath string, owner int64) (*Object, error) {
 	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
 		return nil, err
 	}
-	o := &Object{Key: key, Size: size, SHA256: sha256hex, StorageClass: "STANDARD", DiskPath: diskPath}
+	o := &Object{Key: key, Size: size, SHA256: sha256hex, StorageClass: "STANDARD", DiskPath: diskPath, OwnerID: owner}
 	err = db.QueryRow(`
-		INSERT INTO objects (bucket_id, key, size_bytes, sha256, storage_class, disk_path)
-		VALUES ($1, $2, $3, $4, 'STANDARD', $5) RETURNING id`,
-		bid, key, size, sha256hex, diskPath).Scan(&o.ID)
+		INSERT INTO objects (bucket_id, key, size_bytes, sha256, storage_class, disk_path, owner_id)
+		VALUES ($1, $2, $3, $4, 'STANDARD', $5, NULLIF($6, 0)) RETURNING id`,
+		bid, key, size, sha256hex, diskPath, owner).Scan(&o.ID)
 	if isUniqueViolation(err) {
 		return nil, fmt.Errorf("object %q already exists (v0 has no overwrite)", key)
 	}
@@ -333,28 +386,31 @@ type PartRow struct {
 	DiskPath string // "" when tape-only
 }
 
-func createUpload(db *sql.DB, bucket, key, uploadID string) error {
+func createUpload(db *sql.DB, bucket, key, uploadID string, owner int64) error {
 	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`INSERT INTO objects (bucket_id, key, size_bytes, storage_class, upload_id)
-		VALUES ($1, $2, 0, 'STANDARD', $3)`, bid, key, uploadID)
+	_, err = db.Exec(`INSERT INTO objects (bucket_id, key, size_bytes, storage_class, upload_id, owner_id)
+		VALUES ($1, $2, 0, 'STANDARD', $3, NULLIF($4, 0))`, bid, key, uploadID, owner)
 	return err
 }
 
-func objectByUpload(db *sql.DB, bucket, key, uploadID string) (int64, error) {
+// objectByUpload resolves an open upload to its object id and owner
+// (tenancy: parts may only be managed by the upload's owner or admins).
+func objectByUpload(db *sql.DB, bucket, key, uploadID string) (int64, int64, error) {
 	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var id int64
-	err = db.QueryRow(`SELECT id FROM objects
-		WHERE bucket_id = $1 AND key = $2 AND upload_id = $3`, bid, key, uploadID).Scan(&id)
+	var owner sql.NullInt64
+	err = db.QueryRow(`SELECT id, owner_id FROM objects
+		WHERE bucket_id = $1 AND key = $2 AND upload_id = $3`, bid, key, uploadID).Scan(&id, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, fmt.Errorf("upload %q %q: %w", uploadID, key, ErrNotFound)
+		return 0, 0, fmt.Errorf("upload %q %q: %w", uploadID, key, ErrNotFound)
 	}
-	return id, err
+	return id, owner.Int64, err
 }
 
 // insertPart records an uploaded part. Re-uploading a part number
