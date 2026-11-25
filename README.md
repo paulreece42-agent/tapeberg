@@ -49,6 +49,11 @@ tapeberg ack TB0003L5             # manual changer: "tape is in the drive"
 
 ## S3 (awscli)
 
+Buckets bind to tape pools: CreateBucket binds the serving rig's pool
+(`TAPEBERG_POOL`), and PutObject/RestoreObject queue in the bucket's
+pool — so bucket = pool = tape set. `tapeberg doctor` reports the
+catalog's buckets.
+
 ```sh
 export TAPEBERG_S3_KEY=... TAPEBERG_S3_SECRET=...
 tapeberg s3                                        # serves :7333, SigV4

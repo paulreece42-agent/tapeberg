@@ -143,7 +143,7 @@ func cmdIngest(cfg Config, src, key string) error {
 		return err
 	}
 	defer in.Close()
-	obj, err := ingestStream(db, cfg, "tapeberg", key, in)
+	obj, err := ingestStream(db, cfg, "tapeberg", key, in, cfg.Pool)
 	if err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func cmdIngest(cfg Config, src, key string) error {
 
 // ingestStream stages r into the disk buffer, records the object, and
 // queues it for tape. Shared by the CLI and the S3 PutObject path.
-func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader) (*Object, error) {
+func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool string) (*Object, error) {
 	if err := os.MkdirAll(cfg.BufferDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -178,7 +178,7 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader) (*Obj
 		os.Remove(dst)
 		return nil, err
 	}
-	if err := createArchiveRequest(db, obj.ID, cfg.Pool); err != nil {
+	if err := createArchiveRequest(db, obj.ID, pool); err != nil {
 		return nil, err
 	}
 	return obj, nil
