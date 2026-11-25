@@ -34,6 +34,11 @@ DRIVE=${ST/\/st/\/nst}
 echo "changer=$CHANGER_DEV drive=$DRIVE"
 
 set -a; . "$ROOT/.env"; set +a
+# Hermetic: this test's "human" is a script, not a phone. Never read the
+# host's /etc/tapeberg.conf, and strip notification credentials so the
+# manual-mode section cannot ping a real human.
+export TAPEBERG_CONF=/dev/null
+unset TAPEBERG_TELEGRAM_TOKEN TAPEBERG_TELEGRAM_CHAT TAPEBERG_WEBHOOK_URL TAPEBERG_WEBHOOK_TOKEN
 export TAPEBERG_DRIVE="$DRIVE"
 export TAPEBERG_CHANGER=robot
 export TAPEBERG_CHANGER_DEV="$CHANGER_DEV"
@@ -42,6 +47,7 @@ mkdir -p "$TAPEBERG_BUFFER"
 PSQL="psql $TAPEBERG_DB_URL -tAq"
 
 say "blanking VTL media (erase prior test data — capacity persists otherwise)"
+mtx -f "$CHANGER_DEV" unload >/dev/null 2>&1 || true  # tolerate a leftover load
 for bc in TB0001L5 TB0002L5 TB0003L5; do
   slot=$(mtx -f "$CHANGER_DEV" status | grep "VolumeTag=$bc" | sed 's/.*Storage Element \([0-9]*\):Full.*/\1/')
   mtx -f "$CHANGER_DEV" load "$slot" >/dev/null
@@ -129,15 +135,12 @@ if [ "$ACTION" = "load" ]; then
   slot=$(mtx -f "$CHANGER_DEV" status | grep "VolumeTag=$TAPE" | sed 's/.*Storage Element \([0-9]*\):Full.*/\1/')
   mtx -f "$CHANGER_DEV" load "$slot"
   "$BIN" ack "$TAPE"
-  # worker will next prompt to unload
-  for _ in $(seq 1 120); do
-    grep -q '^ACTION: unload' "$TAPEBERG_ACK_DIR/prompt" 2>/dev/null && break
-    sleep 1
-  done
-  mtx -f "$CHANGER_DEV" unload
-  "$BIN" ack UNLOAD
 fi
+# Manual mode no longer prompts to unload — tapes stay in the drive
+# between jobs. The worker should finish the restore and exit cleanly;
+# a stale unload prompt would mean a regression.
 wait $WPID || fail "manual-mode worker failed"
+[ ! -e "$TAPEBERG_ACK_DIR/prompt" ] || fail "manual mode unexpectedly prompted to unload (tapes should stay put)"
 "$BIN" get e2e-file2 > "$WORK/out2"
 cmp "$WORK/src2" "$WORK/out2" || fail "e2e-file2 differs from source bytes"
 echo "manual-changer restore verified (prompt -> ack -> restore byte-identical)"

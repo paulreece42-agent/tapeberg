@@ -27,6 +27,10 @@ ST=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1)}')
 DRIVE=${ST/\/st/\/nst}
 
 set -a; . "$ROOT/.env"; set +a
+# Hermetic: never read the host's /etc/tapeberg.conf (robot mode, no
+# notification channels) — the conf file belongs to the real rig.
+export TAPEBERG_CONF=/dev/null
+unset TAPEBERG_TELEGRAM_TOKEN TAPEBERG_TELEGRAM_CHAT TAPEBERG_WEBHOOK_URL TAPEBERG_WEBHOOK_TOKEN
 export TAPEBERG_DRIVE="$DRIVE" TAPEBERG_CHANGER=robot TAPEBERG_CHANGER_DEV="$CHANGER_DEV"
 export TAPEBERG_BUFFER="$WORK/buffer"
 export TAPEBERG_S3_KEY="tapeberg-test" TAPEBERG_S3_SECRET="tapeberg-test-secret"
@@ -35,6 +39,7 @@ PSQL="psql $TAPEBERG_DB_URL -tAq"
 AWS="aws --endpoint-url http://127.0.0.1:7333 --region us-east-1"
 
 say "blanking VTL media + resetting catalog together (they MUST stay in sync)"
+mtx -f "$CHANGER_DEV" unload >/dev/null 2>&1 || true  # tolerate a leftover load
 for bc in TB0001L5 TB0002L5 TB0003L5; do
   slot=$(mtx -f "$CHANGER_DEV" status | grep "VolumeTag=$bc" | sed 's/.*Storage Element \([0-9]*\):Full.*/\1/')
   mtx -f "$CHANGER_DEV" load "$slot" >/dev/null

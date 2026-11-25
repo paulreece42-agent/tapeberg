@@ -266,9 +266,9 @@ func nextArchiveID(db *sql.DB, tapeID int64) (int64, error) {
 	return id, err
 }
 
-func insertTapeFile(db *sql.DB, tapeID, objectID, archiveID, size int64) error {
-	_, err := db.Exec(`INSERT INTO tape_files (tape_id, object_id, archive_id, size_bytes) VALUES ($1,$2,$3,$4)`,
-		tapeID, objectID, archiveID, size)
+func insertTapeFile(db *sql.DB, tapeID, objectID, archiveID, physicalFile, size int64) error {
+	_, err := db.Exec(`INSERT INTO tape_files (tape_id, object_id, archive_id, physical_file, size_bytes) VALUES ($1,$2,$3,$4,$5)`,
+		tapeID, objectID, archiveID, physicalFile, size)
 	return err
 }
 
@@ -318,18 +318,19 @@ func pendingRetrieves(db *sql.DB) ([]RetrieveReq, error) {
 }
 
 type TapeFileLoc struct {
-	TapeID    int64
-	Barcode   string
-	ArchiveID int64
+	TapeID       int64
+	Barcode      string
+	ArchiveID    int64
+	PhysicalFile int64
 }
 
 func objectTapeFile(db *sql.DB, objectID int64) (*TapeFileLoc, error) {
 	t := &TapeFileLoc{}
 	err := db.QueryRow(`
-		SELECT tf.tape_id, t.barcode, tf.archive_id
+		SELECT tf.tape_id, t.barcode, tf.archive_id, tf.physical_file
 		FROM tape_files tf JOIN tapes t ON t.id = tf.tape_id
 		WHERE tf.object_id = $1 ORDER BY tf.written_at DESC LIMIT 1`, objectID).
-		Scan(&t.TapeID, &t.Barcode, &t.ArchiveID)
+		Scan(&t.TapeID, &t.Barcode, &t.ArchiveID, &t.PhysicalFile)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("object %d has no tape placement: %w", objectID, ErrNotFound)
 	}
