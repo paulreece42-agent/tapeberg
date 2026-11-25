@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 const usageText = `tapeberg — a personal Glacier on your own tape
@@ -27,6 +28,7 @@ usage:
   tapeberg ingest <src-path> [key]   stage a file for archival (queues it)
   tapeberg restore <key> [days]      queue a Glacier-style restore (default 1 day, max 30)
   tapeberg get <key>                 cat a restored object to stdout
+  tapeberg tape add <barcode> [capacity]  register a tape in the catalog (capacity like 1500GB; default 1500GB, LTO-5)
   tapeberg status                    catalog + queue summary
   tapeberg worker                    drain archive/restore queues once (run from cron)
   tapeberg s3 [listen-addr]          serve the S3/Glacier wire protocol (default :7333)
@@ -42,6 +44,9 @@ func main() {
 }
 
 func run(args []string) error {
+	if err := loadConfEnv(); err != nil {
+		return fmt.Errorf("conf: %w", err)
+	}
 	if len(args) == 0 {
 		fmt.Fprint(os.Stderr, usageText)
 		os.Exit(2)
@@ -93,6 +98,12 @@ func run(args []string) error {
 			return fmt.Errorf("usage: tapeberg get <key>")
 		}
 		return cmdGet(cfg, rest[0])
+
+	case "tape":
+		if len(rest) != 2 && len(rest) != 3 || rest[0] != "add" {
+			return fmt.Errorf("usage: tapeberg tape add <barcode> [capacity]")
+		}
+		return cmdTapeAdd(cfg, rest[1:])
 
 	case "status":
 		return cmdStatus(cfg)
@@ -237,6 +248,67 @@ func envDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseCapacity accepts a byte count or a size with unit, e.g. 100MB,
+// 1500GB, 1.5TB, 128GiB. Bare numbers are bytes.
+func parseCapacity(s string) (int64, error) {
+	units := []struct {
+		suffix string
+		mult   int64
+	}{
+		{"kib", 1 << 10}, {"mib", 1 << 20}, {"gib", 1 << 30}, {"tib", 1 << 40},
+		{"kb", 1e3}, {"mb", 1e6}, {"gb", 1e9}, {"tb", 1e12},
+	}
+	s = strings.TrimSpace(s)
+	for _, u := range units {
+		if suffix := strings.ToLower(strings.TrimSpace(u.suffix)); strings.HasSuffix(strings.ToLower(s), u.suffix) {
+			num := strings.TrimSpace(s[:len(s)-len(suffix)])
+			f, err := strconv.ParseFloat(num, 64)
+			if err != nil {
+				return 0, fmt.Errorf("capacity %q: bad number %q", s, num)
+			}
+			return int64(f * float64(u.mult)), nil
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("capacity %q: expected a byte count or size like 1500GB", s)
+	}
+	return n, nil
+}
+
+// cmdTapeAdd registers a tape in the catalog (default pool). Capacity is
+// only a scheduling hint — the drive's EOM sense is authoritative.
+func cmdTapeAdd(cfg Config, args []string) error {
+	barcode := args[0]
+	capacity := int64(1500000000000) // LTO-5 native nominal
+	if len(args) == 2 {
+		var err error
+		capacity, err = parseCapacity(args[1])
+		if err != nil {
+			return err
+		}
+	}
+	db, err := openDB(cfg.DBURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	inserted, err := db.Exec(`
+		INSERT INTO tapes (barcode, pool_id, is_cleaning, capacity_bytes)
+		VALUES ($1, (SELECT id FROM tape_pools WHERE name = 'default'), $2, $3)
+		ON CONFLICT (barcode) DO NOTHING`,
+		barcode, strings.HasPrefix(strings.ToUpper(barcode), "CLN"), capacity)
+	if err != nil {
+		return err
+	}
+	if n, _ := inserted.RowsAffected(); n == 0 {
+		return fmt.Errorf("tape %s already registered", barcode)
+	}
+	fmt.Printf("registered tape %s (pool default, capacity hint %d bytes — EOM is authoritative)\n", barcode, capacity)
+	fmt.Println("next: 'tapeberg doctor' to verify, then ingest + worker will pick it up")
+	return nil
 }
 
 // LoadConfig reads and validates the environment configuration.
