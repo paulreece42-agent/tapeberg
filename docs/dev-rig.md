@@ -12,7 +12,10 @@ so `mtx`, `mt`, `sg_*` and Tapeberg's own code exercise the genuine path.
   single emulated **IBM ULT3580-TD5** (LTO-5) drive, serial TB-DRIVE01,
   plus 16 data tapes (barcodes `TB0001L5`..`TB0016L5`) and 1 cleaning tape.
 - mhvtl 1.8.0 (git 2c40a93) built from source, kernel module `mhvtl.ko`
-  installed for the running kernel and loaded at boot via systemd units.
+  installed for the running kernel and loaded at boot via systemd units
+  (`mhvtl.target`, `vtllibrary@10`, `vtltape@11`).
+- User `major` is in the `tape` group for unprivileged drive access
+  (new sessions only; the changer node is group `cdrom`).
 
 ## Source / build (Ubuntu 24.04)
 
@@ -31,7 +34,7 @@ sudo systemctl daemon-reload
 
 Gotchas found the hard way:
 - `libudev-dev` is required (mhvtl-bay-monitor includes `<libudev.h>`).
-- `liblz4-dev` is required for the new codec path (`lz4.h`, `mhvtl_io.c`).
+- `liblz4-dev` is required for the codec path (`lz4.h` in `mhvtl_io.c`).
 - If a `sudo make install` half-fails, the tree is left root-owned and
   the next user-space build dies with a linker "Permission denied" —
   `sudo chown -R $(id -u):$(id -g) .` and rebuild.
@@ -39,27 +42,52 @@ Gotchas found the hard way:
 
 ## Config
 
-`deploy/mhvtl/device.conf` and `deploy/mhvtl/library_contents.10` in this
-repo are the source of truth. Deploy:
+`deploy/mhvtl/` in this repo is the source of truth: `device.conf`
+(library + drive), `library_contents.10` (media), `mhvtl.conf` (runtime).
+Deploy:
 
 ```sh
 sudo cp deploy/mhvtl/device.conf /etc/mhvtl/device.conf
 sudo cp deploy/mhvtl/library_contents.10 /etc/mhvtl/library_contents.10
+sudo cp deploy/mhvtl/mhvtl.conf /etc/mhvtl/mhvtl.conf
 sudo rm -f /etc/mhvtl/library_contents.30   # stock sample library
-sudo make_vtl_media                        # creates /var/lib/mhvtl media
+sudo systemctl stop mhvtl.target            # media is created at gen time,
+sudo rm -rf /var/lib/mhvtl/*                # so regenerate it after
+sudo make_vtl_media                         # changing CAPACITY
 sudo systemctl enable --now mhvtl.target
 ```
 
-Default media capacity (500 MB per tape) is set in `/etc/mhvtl/mhvtl.conf`
-(`CAPACITY=500`) — small on purpose: EOM/early-warning handling is testable
-in seconds. Raise it when we want realistic long streams.
+Media capacity is deliberately LOW: `CAPACITY=100` (MB per tape) forces
+frequent EOM / tape-swap events, which is exactly what this rig is for.
+Media data files only grow as bytes are actually written (17 tapes cost
+at most ~1.7 GB). Bump to 1500000 to emulate real LTO-5 (1.5 TB).
+
+## Rig quirks (verified empirically — respect these in Tapeberg code)
+
+- **Tape capacity is accounted post-compression.** The emulated drive
+  stores lzo-compressed data, and EOM fires on *stored* bytes: 131 MB of
+  zeros fit on a "100 MB" tape with no EOM, while urandom hit EOM at
+  exactly 102,367,232 bytes (1,562 x 64KiB blocks). **Use incompressible
+  test data (`/dev/urandom`) whenever an EOM/swap test must trigger.**
+- **Single write() calls larger than ~512 KiB return `EBUSY`** from the
+  st driver against the emulated drive (verified with strace: open()
+  succeeds, the write syscall fails before any SCSI WRITE is issued;
+  64k and 512k writes stream at ~85-480 MB/s, 768k/896k/1M fail).
+  Tapeberg's tape writer should chunk at 256k-512k, not rely on big
+  single writes.
+- **`/dev/sgN` numbering shuffles across mhvtl restarts** (changer and
+  drive swapped sg2/sg3 after one restart). Never hardcode sgN —
+  discover via `lsscsi -g` at runtime, or address the changer via the
+  type-stable `/dev/sch0`.
+- After `mtx load`, give the drive a moment (or poll `mt status`) before
+  the first write; an immediate write can race the mount.
 
 ## Operating the VTL
 
 ```sh
 lsscsi -g                     # find the mediumx /dev/sgN and drive
 mtx -f /dev/sgN status        # slot map
-mtx -f /dev/sgN load 1       # load tape 1 into drive 1
+mtx -f /dev/sgN load 1        # load tape 1 into drive 0
 mtx -f /dev/sgN unload        # back to its slot
 sudo vtlcmd <naa> help        # daemon control/debug
 sudo journalctl -u vtltape@11 -u vtllibrary@10   # logs
