@@ -75,6 +75,21 @@ at most ~1.7 GB). Bump to 1500000 to emulate real LTO-5 (1.5 TB).
   64k and 512k writes stream at ~85-480 MB/s, 768k/896k/1M fail).
   Tapeberg's tape writer should chunk at 256k-512k, not rely on big
   single writes.
+- **The st driver appends one filemark automatically on a write-mode
+  close.** Adding an explicit `mt weof 1` on top produces DOUBLE
+  filemarks — and a restore that seeks into the empty inter-filemark
+  gap reads zero bytes (sha256 of empty input). Writers must rely on
+  the auto-filemark, not add their own.
+- **Virtual media must be erased to reclaim capacity** (`mtx load` +
+  `mt erase`): data files persist across mounts and daemon restarts,
+  so old test data keeps a "full" tape full. `mt erase` on mhvtl is
+  instant and restores full capacity.
+- **Group memberships apply per process tree, not per login.**
+  Shells spawned by a long-lived daemon (e.g. the agent gateway) keep
+  the credentials the daemon started with — adding a user to the
+  `tape` group won't show up until the daemon restarts. Use
+  `sudo -u <user>` (which builds fresh supplementary groups from the
+  group DB) to run rig commands with new memberships.
 - **`/dev/sgN` numbering shuffles across mhvtl restarts** (changer and
   drive swapped sg2/sg3 after one restart). Never hardcode sgN —
   discover via `lsscsi -g` at runtime, or address the changer via the
