@@ -178,7 +178,7 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool 
 		os.Remove(dst)
 		return nil, err
 	}
-	if err := createArchiveRequest(db, obj.ID, pool); err != nil {
+	if err := createArchiveRequest(db, obj.ID, pool, 1); err != nil {
 		return nil, err
 	}
 	return obj, nil
@@ -219,6 +219,32 @@ func cmdGet(cfg Config, key string) error {
 	obj, err := getObjectIn(db, "tapeberg", key)
 	if err != nil {
 		return err
+	}
+	// Multipart: merge at the CLI layer too — parts concatenate in order.
+	if mp, err := isMultipart(db, obj.ID); err != nil {
+		return err
+	} else if mp {
+		parts, err := listParts(db, obj.ID)
+		if err != nil {
+			return err
+		}
+		for _, p := range parts {
+			if p.DiskPath == "" {
+				return fmt.Errorf("InvalidObjectState: object is in storage class %s — run 'tapeberg restore %s' first", obj.StorageClass, key)
+			}
+		}
+		for _, p := range parts {
+			f, err := os.Open(p.DiskPath)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(os.Stdout, f); err != nil {
+				f.Close()
+				return err
+			}
+			f.Close()
+		}
+		return nil
 	}
 	if obj.StorageClass != "STANDARD" || obj.DiskPath == "" {
 		return fmt.Errorf("InvalidObjectState: object is in storage class %s — run 'tapeberg restore %s' first", obj.StorageClass, key)

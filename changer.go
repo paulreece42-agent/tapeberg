@@ -74,6 +74,19 @@ func (r *RobotChanger) slotFor(barcode string) (int, error) {
 }
 
 func (r *RobotChanger) Load(barcode string) error {
+	// Idempotent: multipart restores walk part sequences that can sit
+	// on the same tape; reloading an already-loaded tape errors. And
+	// switching tapes unloads the current one first (a library can
+	// only hold one).
+	cur, err := r.loadedBarcode()
+	if err == nil && cur == barcode {
+		return nil
+	}
+	if err == nil && cur != "" {
+		if uerr := r.Unload(); uerr != nil {
+			return uerr
+		}
+	}
 	slot, err := r.slotFor(barcode)
 	if err != nil {
 		return err
@@ -83,6 +96,29 @@ func (r *RobotChanger) Load(barcode string) error {
 	}
 	time.Sleep(time.Second) // mount settle (rig-verified race)
 	return nil
+}
+
+// loadedBarcode reports the volume tag in the drive ("" if empty),
+// parsed from mtx status's Data Transfer Element line. Formats vary —
+// "VolumeTag = X", "VolumeTag= X", "VolumeTag=X" — so parse loosely.
+func (r *RobotChanger) loadedBarcode() (string, error) {
+	out, err := exec.Command("mtx", "-f", r.Dev, "status").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("mtx status: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.Contains(line, "Data Transfer Element") {
+			continue
+		}
+		if i := strings.Index(line, "VolumeTag"); i >= 0 {
+			tag := strings.TrimSpace(strings.TrimLeft(line[i+len("VolumeTag"):], "= 	"))
+			if tag == "" {
+				return "", nil
+			}
+			return strings.Fields(tag)[0], nil
+		}
+	}
+	return "", nil
 }
 
 func (r *RobotChanger) Unload() error {

@@ -54,6 +54,28 @@ Buckets bind to tape pools: CreateBucket binds the serving rig's pool
 pool — so bucket = pool = tape set. `tapeberg doctor` reports the
 catalog's buckets.
 
+### Multipart (files larger than a single tape)
+
+Multipart uploads work the CTA way: **parts stay parts**. Each part is
+one atomic tape file (parts are capped at 5GB by S3 clients, so every
+part fits a tape), parts archive to tape as they arrive — a
+still-streaming upload never fills the buffer disk — and GET/restore
+merge at the API layer by concatenating parts in order. Objects larger
+than any single tape just span several.
+
+The tar-pipe workflow works end to end:
+
+```sh
+tar c ~/photos | s3cmd put - s3://tapeberg/photos.tar      # multipart streaming upload
+aws s3api restore-object --bucket tapeberg --key photos.tar --restore-request Days=3
+aws s3api head-object --bucket tapeberg --key photos.tar   # x-amz-restore: ongoing-request="false"
+s3cmd get s3://tapeberg/photos.tar - | tar xv              # streamed merged read
+```
+
+Complete computes the S3-style multipart ETag (md5-of-md5s); abort
+drops every catalog trace (parts already on tape become dead space).
+Ranged GETs span part boundaries.
+
 ```sh
 export TAPEBERG_S3_KEY=... TAPEBERG_S3_SECRET=...
 tapeberg s3                                        # serves :7333, SigV4
