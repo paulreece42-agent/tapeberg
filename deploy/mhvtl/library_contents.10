@@ -1,0 +1,29 @@
+VERSION: 2
+
+# Tapeberg dev rig media: LTO-5 data tapes TB0001L5..TB0016L5 plus one
+# cleaning tape. Barcodes are 8 chars so the trailing "L5" = LTO-5 media.
+# Deploy to /etc/mhvtl/library_contents.10
+
+Drive 1:
+
+Picker 1:
+
+MAP 1:
+
+Slot 1: TB0001L5
+Slot 2: TB0002L5
+Slot 3: TB0003L5
+Slot 4: TB0004L5
+Slot 5: TB0005L5
+Slot 6: TB0006L5
+Slot 7: TB0007L5
+Slot 8: TB0008L5
+Slot 9: TB0009L5
+Slot 10: TB0010L5
+Slot 11: TB0011L5
+Slot 12: TB0012L5
+Slot 13: TB0013L5
+Slot 14: TB0014L5
+Slot 15: TB0015L5
+Slot 16: TB0016L5
+Slot 17: CLN001L5
