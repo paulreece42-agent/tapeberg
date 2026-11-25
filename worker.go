@@ -89,7 +89,7 @@ func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 		if err != nil {
 			return err
 		}
-		werr := writeTapeFile(cfg.Drive, req.DiskPath)
+		physical, werr := writeTapeFile(cfg.Drive, req.DiskPath)
 		if werr == ErrTapeFull {
 			if err := markTapeFull(db, tape.ID); err != nil {
 				return err
@@ -106,7 +106,7 @@ func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 			_ = ch.Unload()
 			return nil // request terminal; drain continues with the next
 		}
-		if err := insertTapeFile(db, tape.ID, req.ObjectID, archiveID, req.Size); err != nil {
+		if err := insertTapeFile(db, tape.ID, req.ObjectID, archiveID, physical, req.Size); err != nil {
 			return err
 		}
 		if err := addTapeWritten(db, tape.ID, req.Size); err != nil {
@@ -159,7 +159,9 @@ func restoreOne(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
 		return err
 	}
 	dst := filepath.Join(cfg.BufferDir, req.Key)
-	sha, rerr := readTapeFile(cfg.Drive, tf.ArchiveID, dst)
+	// Seek by the recorded PHYSICAL position — archive_id counts only
+	// our files, the tape may hold more.
+	sha, rerr := readTapeFile(cfg.Drive, tf.PhysicalFile, dst)
 	if rerr != nil {
 		_ = os.Remove(dst)
 		_ = failRetrieve(db, req.ID, rerr.Error())

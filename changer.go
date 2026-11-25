@@ -132,7 +132,41 @@ func (m *ManualChanger) waitAck(want string) error {
 	return fmt.Errorf("no manual-changer ack for %q within an hour — giving up", want)
 }
 
+// tapeLoaded reports whether a tape sits in the drive (mt status: the
+// DR_OPEN bit means empty/door-open; a loaded tape reports ONLINE).
+func (m *ManualChanger) tapeLoaded() bool {
+	out, _ := exec.Command("mt", "-f", m.Drive, "status").CombinedOutput()
+	s := string(out)
+	return !strings.Contains(s, "DR_OPEN") && strings.Contains(s, "ONLINE")
+}
+
+// eject rewinds and retracts the tape so the human can insert another.
+func (m *ManualChanger) eject() {
+	if out, err := exec.Command("mt", "-f", m.Drive, "rewind").CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "MANUAL CHANGER: rewind before eject failed: %s: %v\n", strings.TrimSpace(string(out)), err)
+	}
+	if out, err := exec.Command("mt", "-f", m.Drive, "offline").CombinedOutput(); err != nil {
+		// Not fatal — the load prompt asks the human to eject by hand.
+		fmt.Fprintf(os.Stderr, "MANUAL CHANGER: auto-eject failed (%s: %v) — please eject by hand\n", strings.TrimSpace(string(out)), err)
+	}
+}
+
 func (m *ManualChanger) Load(barcode string) error {
+	// Ask the DRIVE, not the catalog: LTO cartridges report their own
+	// barcode via READ ATTRIBUTE (MAM 0x0806), so we know exactly which
+	// tape is loaded. Same tape = no swap, no ping, no prompt.
+	if cur := readDriveBarcode(m.Drive); cur == barcode {
+		fmt.Fprintf(os.Stderr, "MANUAL CHANGER: drive reports %s already loaded — no swap needed\n", cur)
+		return nil
+	} else if cur != "" {
+		fmt.Fprintf(os.Stderr, "MANUAL CHANGER: drive reports %s, need %s — ejecting to make room\n", cur, barcode)
+		m.eject()
+	} else if m.tapeLoaded() {
+		// A tape is physically in the drive but its barcode is unreadable
+		// (unreadable CM, or a non-LTO cart). Eject so the human picks.
+		fmt.Fprintf(os.Stderr, "MANUAL CHANGER: unknown tape in %s — ejecting to make room for %s\n", m.Drive, barcode)
+		m.eject()
+	}
 	if err := m.writePrompt(fmt.Sprintf(
 		`ACTION: load
 TAPE: %s
@@ -145,21 +179,25 @@ Insert tape %s into the drive, then acknowledge:
 	}
 	fmt.Fprintf(os.Stderr, "MANUAL CHANGER: load %s into %s — waiting for 'tapeberg ack %s'\n", barcode, m.Drive, barcode)
 	m.notify(fmt.Sprintf("🧊 Tapeberg: load tape %s into drive %s, then run: tapeberg ack %s", barcode, m.Drive, barcode))
-	return m.waitAck(barcode)
+	if err := m.waitAck(barcode); err != nil {
+		return err
+	}
+	// The drive verifies the human put in the RIGHT tape.
+	switch after := readDriveBarcode(m.Drive); {
+	case after == barcode:
+		fmt.Fprintf(os.Stderr, "MANUAL CHANGER: drive confirms %s loaded\n", barcode)
+	case after == "":
+		fmt.Fprintf(os.Stderr, "MANUAL CHANGER: warning — cannot read loaded barcode (MAM unavailable); proceeding on trust\n")
+	default:
+		return fmt.Errorf("wrong tape loaded: drive reports %s, wanted %s — remove it and re-run", after, barcode)
+	}
+	return nil
 }
 
 func (m *ManualChanger) Unload() error {
-	if err := m.writePrompt(fmt.Sprintf(
-		`ACTION: unload
-TAPE: (any)
-DRIVE: %s
-
-Remove the tape from the drive and put it away, then acknowledge:
-  tapeberg ack UNLOAD
-`, m.Drive)); err != nil {
-		return err
-	}
-	fmt.Fprintf(os.Stderr, "MANUAL CHANGER: unload %s — waiting for 'tapeberg ack UNLOAD'\n", m.Drive)
-	m.notify(fmt.Sprintf("🧊 Tapeberg: remove the tape from drive %s and put it away, then run: tapeberg ack UNLOAD", m.Drive))
-	return m.waitAck("UNLOAD")
+	// Deliberate no-op: manual mode leaves the tape in the drive between
+	// jobs — no "please remove the tape" pings. The next Load() reads the
+	// drive's barcode and only ejects (mt offline) when a DIFFERENT tape
+	// is needed.
+	return nil
 }

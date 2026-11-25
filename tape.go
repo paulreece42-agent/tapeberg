@@ -49,23 +49,59 @@ func mtRetry(dev string, tries int, args ...string) error {
 	return err
 }
 
+// tapeFileNumber parses "File number=N" from `mt status`. The st driver
+// numbers the file the head is positioned IN (0-based); -1 means before
+// the first file (blank tape / BOT).
+func tapeFileNumber(dev string) (int64, error) {
+	out, err := exec.Command("mt", "-f", dev, "status").CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("mt status: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	s := string(out)
+	i := strings.Index(s, "File number=")
+	if i < 0 {
+		return 0, fmt.Errorf("mt status: no File number in %q", strings.TrimSpace(s))
+	}
+	rest := s[i+len("File number="):]
+	if j := strings.IndexAny(rest, ",\n"); j >= 0 {
+		rest = rest[:j]
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("mt status: bad File number %q", rest)
+	}
+	return n, nil
+}
+
 // writeTapeFile writes src to the tape at EOD and appends one filemark.
+// It returns the 1-based PHYSICAL file position the data landed in (as
+// reported by the drive) — the catalog must record this, not assume it
+// equals our archive_id, because real media can carry foreign files
+// (e.g. a leading empty file at BOT) that shift every position.
 // On EOM it returns ErrTapeFull and leaves the catalog untouched; any
 // partially written data has no filemark and is overwritten by the next
 // write (the tape is marked full by the caller).
-func writeTapeFile(dev, src string) error {
+func writeTapeFile(dev, src string) (int64, error) {
 	if err := mtRetry(dev, 5, "eod"); err != nil {
-		return err
+		return 0, err
+	}
+	fn, err := tapeFileNumber(dev)
+	if err != nil {
+		return 0, err
+	}
+	physical := fn + 1
+	if fn < 0 {
+		physical = 1 // blank tape: positioned before any file
 	}
 	in, err := os.Open(src)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer in.Close()
 
 	out, err := os.OpenFile(dev, os.O_WRONLY, 0)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	buf := make([]byte, tapeChunk)
 	var werr error
@@ -89,15 +125,15 @@ write:
 	}
 	if werr != nil {
 		if errors.Is(werr, syscall.ENOSPC) {
-			return ErrTapeFull
+			return 0, ErrTapeFull
 		}
-		return werr
+		return 0, werr
 	}
 	// No explicit filemark: the st driver appends one on the final
 	// write-mode close (verified against the rig — an explicit `mt weof`
 	// on top of it produces double filemarks, and seeks into the empty
 	// inter-filemark gap read zero bytes).
-	return nil
+	return physical, nil
 }
 
 // readTapeFile positions the drive at file archiveID (1-based, counting

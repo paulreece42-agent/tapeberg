@@ -54,6 +54,9 @@ func cmdDoctor(cfg Config, args []string) error {
 			medium = "tape loaded and online"
 		}
 		fmt.Printf("✓ drive %s present (%s)\n", cfg.Drive, medium)
+		if bc := readDriveBarcode(cfg.Drive); bc != "" {
+			fmt.Printf("✓ drive reports loaded tape: %s\n", bc)
+		}
 	}
 
 	// 3. Changer
