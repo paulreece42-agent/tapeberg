@@ -139,6 +139,70 @@ cmp "$WORK/obj" "$WORK/out" || fail "restored bytes differ from upload"
 say "list-objects-v2"
 $AWS s3api list-objects-v2 --bucket vtl --prefix s3e2e --query "Contents[].Key" --output text | grep -q s3e2e-obj || fail "object not listed"
 
+say "multipart: 240MB via awscli (bigger than any single 100MB tape)"
+dd if=/dev/urandom of="$WORK/big" bs=1M count=240 status=none
+$AWS s3 cp "$WORK/big" s3://vtl/s3e2e-mp-big >/dev/null || fail "multipart upload failed"
+sz=$($AWS s3api head-object --bucket vtl --key s3e2e-mp-big --query ContentLength --output text)
+[ "$sz" = 251658240 ] || fail "completed multipart size should be 240MiB, got $sz"
+
+say "worker: 30 part archives across multiple tapes"
+"$BIN" worker || fail "worker failed archiving parts"
+sc=$($PSQL -c "SELECT storage_class FROM objects WHERE key='s3e2e-mp-big'")
+[ "$sc" = GLACIER ] || fail "object should be GLACIER after all parts archived, got $sc"
+ntapes=$($PSQL -c "SELECT count(DISTINCT t.barcode) FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-mp-big'")
+[ "$ntapes" -ge 2 ] || fail "240MB should span multiple tapes, found $ntapes"
+
+say "get on tape-only multipart → InvalidObjectState (Glacier contract)"
+if $AWS s3api get-object --bucket vtl --key s3e2e-mp-big "$WORK/mp-early" 2>"$WORK/mperr"; then
+  fail "get-object should have failed on a GLACIER multipart object"
+fi
+grep -q "InvalidObjectState" "$WORK/mperr" || fail "expected InvalidObjectState, got: $(cat "$WORK/mperr")"
+
+say "restore multipart → 202; worker materializes all parts"
+$AWS s3api restore-object --bucket vtl --key s3e2e-mp-big --restore-request Days=2 || fail "restore-object failed"
+"$BIN" worker || fail "worker failed restoring parts"
+rstate=$($PSQL -c "SELECT r.state FROM retrieve_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='s3e2e-mp-big' ORDER BY r.id DESC LIMIT 1")
+[ "$rstate" = restored ] || fail "multipart restore ended '$rstate': $($PSQL -c "SELECT left(COALESCE(r.error,''),160) FROM retrieve_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='s3e2e-mp-big' ORDER BY r.id DESC LIMIT 1")"
+
+say "multipart GET → byte-identical (the API-layer merge)"
+$AWS s3 cp s3://vtl/s3e2e-mp-big "$WORK/mp-out" >/dev/null || fail "multipart get failed"
+cmp "$WORK/big" "$WORK/mp-out" || fail "merged bytes differ from upload"
+
+say "ranged GET into the middle of a multipart object"
+$AWS s3api get-object --bucket vtl --key s3e2e-mp-big --range bytes=100000000-100010000 "$WORK/mp-range" >/dev/null || fail "ranged get failed"
+dd if="$WORK/big" bs=1 skip=100000000 count=10001 status=none of="$WORK/mp-range-expected"
+cmp "$WORK/mp-range-expected" "$WORK/mp-range" || fail "ranged merge differs"
+
+say "tar-pipe: s3cmd multipart streaming upload"
+mkdir -p "$WORK/tarsrc"
+echo "tapeberg-tar-pipe-$RANDOM" > "$WORK/tarsrc/hello.txt"
+dd if=/dev/urandom of="$WORK/tarsrc/blob.bin" bs=1M count=12 status=none
+cat > "$WORK/s3cfg" <<CFG
+[default]
+access_key = $TAPEBERG_S3_KEY
+secret_key = $TAPEBERG_S3_SECRET
+host_base = 127.0.0.1:7333
+host_bucket = 127.0.0.1:7333
+use_https = False
+enable_multipart = True
+multipart_chunk_size_mb = 5
+CFG
+tar -C "$WORK/tarsrc" -cf - . | s3cmd --config "$WORK/s3cfg" put - s3://vtl/s3e2e-tar-pipe >/dev/null || fail "s3cmd streaming put failed"
+"$BIN" worker || fail "worker failed archiving tar-pipe parts"
+$AWS s3api restore-object --bucket vtl --key s3e2e-tar-pipe --restore-request Days=1 || fail "tar-pipe restore failed"
+"$BIN" worker || fail "worker failed restoring tar-pipe"
+
+say "tar-pipe read-back: s3cmd streaming get | tar -t"
+s3cmd --config "$WORK/s3cfg" get s3://vtl/s3e2e-tar-pipe - 2>/dev/null | tar -tf - | grep -q hello.txt || fail "tar-pipe round-trip failed"
+
+say "abort multipart upload"
+UPID=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-mp-abort --query UploadId --output text)
+$AWS s3api upload-part --bucket vtl --key s3e2e-mp-abort --upload-id "$UPID" --part-number 1 --body "$WORK/obj" >/dev/null || fail "upload-part failed"
+$AWS s3api abort-multipart-upload --bucket vtl --key s3e2e-mp-abort --upload-id "$UPID" || fail "abort failed"
+if $AWS s3api head-object --bucket vtl --key s3e2e-mp-abort >/dev/null 2>&1; then
+  fail "aborted upload should not be visible"
+fi
+
 say "SigV4 is enforced (bad signature rejected)"
 if AWS_SECRET_ACCESS_KEY="wrong-secret" $AWS s3api list-buckets >/dev/null 2>&1; then
   fail "bad credentials were accepted"

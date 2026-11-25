@@ -16,17 +16,22 @@
 package main
 
 import (
+	"bufio"
 	"crypto/hmac"
+	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,26 +77,28 @@ type s3Auth struct {
 	signature string
 }
 
+// parseSigV4 parses the SigV4 Authorization header. Clients differ in
+// spacing: awscli writes "Credential=..., SignedHeaders=..." (comma +
+// space) while s3cmd packs it into one whitespace-free token — so split
+// on commas and trim, never on whitespace.
 func parseSigV4(h string) (*s3Auth, bool) {
 	if !strings.HasPrefix(h, "AWS4-HMAC-SHA256 ") {
 		return nil, false
 	}
-	get := func(prefix string) string {
-		for _, f := range strings.Fields(strings.TrimPrefix(h, "AWS4-HMAC-SHA256 ")) {
-			if strings.HasPrefix(f, prefix) {
-				return strings.TrimSuffix(strings.TrimPrefix(f, prefix), ",")
-			}
+	fields := make(map[string]string)
+	for _, part := range strings.Split(strings.TrimPrefix(h, "AWS4-HMAC-SHA256 "), ",") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(part), "="); ok {
+			fields[strings.TrimSpace(k)] = v
 		}
-		return ""
 	}
-	cred := strings.Split(get("Credential="), "/")
-	if len(cred) != 5 {
+	cred := strings.Split(fields["Credential"], "/")
+	if len(cred) != 5 || fields["SignedHeaders"] == "" || fields["Signature"] == "" {
 		return nil, false
 	}
 	return &s3Auth{
 		accessKey: cred[0], date: cred[1], region: cred[2], service: cred[3],
-		signed:    strings.Split(get("SignedHeaders="), ";"),
-		signature: get("Signature="),
+		signed:    strings.Split(fields["SignedHeaders"], ";"),
+		signature: fields["Signature"],
 	}, true
 }
 
@@ -247,6 +254,9 @@ func (s *s3srv) verifySigV4(r *http.Request) error {
 	kSigning := hmacSHA256(kService, "aws4_request")
 	want := hex.EncodeToString(hmacSHA256(kSigning, sts))
 	if subtle.ConstantTimeCompare([]byte(want), []byte(auth.signature)) != 1 {
+		if os.Getenv("TAPEBERG_S3_DEBUG") != "" {
+			fmt.Fprintf(os.Stderr, "SIGV4 MISMATCH\n--- canonical request ---\n%s\n--- string to sign ---\n%s\n--- got %s want %s\n", cr, sts, auth.signature, want)
+		}
 		return errS3("SignatureDoesNotMatch", "signature mismatch", http.StatusForbidden)
 	}
 	return nil
@@ -414,12 +424,23 @@ func (s *s3srv) serveBucket(w http.ResponseWriter, r *http.Request, bucket strin
 }
 
 func (s *s3srv) serveObject(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	q := r.URL.Query()
 	switch {
-	case r.Method == http.MethodPut && !r.URL.Query().Has("tagging"):
+	case r.Method == http.MethodPost && q.Has("uploads"):
+		return s.initiateMultipart(w, r, bucket, key)
+	case r.Method == http.MethodPut && q.Has("uploadId") && q.Has("partNumber"):
+		return s.putPart(w, r, bucket, key)
+	case r.Method == http.MethodGet && q.Has("uploadId"):
+		return s.listUploadParts(w, r, bucket, key)
+	case r.Method == http.MethodPost && q.Has("uploadId"):
+		return s.completeMultipart(w, r, bucket, key)
+	case r.Method == http.MethodDelete && q.Has("uploadId"):
+		return s.abortMultipart(w, r, bucket, key)
+	case r.Method == http.MethodPut && !q.Has("tagging"):
 		return s.putObject(w, r, bucket, key)
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
 		return s.getObject(w, r, bucket, key)
-	case r.Method == http.MethodPost && r.URL.Query().Has("restore"):
+	case r.Method == http.MethodPost && q.Has("restore"):
 		return s.restoreObject(w, r, bucket, key)
 	default:
 		return errS3("NotImplemented", "operation not supported (v0)", http.StatusNotImplemented)
@@ -435,7 +456,7 @@ func (s *s3srv) putObject(w http.ResponseWriter, r *http.Request, bucket, key st
 	if err != nil {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
-	obj, err := ingestStream(s.db, s.cfg, bucket, key, r.Body, pool)
+	obj, err := ingestStream(s.db, s.cfg, bucket, key, requestBody(r), pool)
 	if err != nil {
 		if strings.Contains(err.Error(), "already exists") {
 			return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
@@ -471,6 +492,13 @@ func (s *s3srv) getObject(w http.ResponseWriter, r *http.Request, bucket, key st
 	if err != nil {
 		return errS3("NoSuchKey", "key does not exist", http.StatusNotFound)
 	}
+	// Multipart: merge at the API layer — the parts concatenate in
+	// order (Range requests included, via the concat seek reader).
+	if mp, err := isMultipart(s.db, obj.ID); err != nil {
+		return err
+	} else if mp {
+		return s.getMultipart(w, r, obj, key)
+	}
 	if obj.DiskPath == "" {
 		if obj.StorageClass == "GLACIER" || obj.StorageClass == "DEEP_ARCHIVE" {
 			if r.Method == http.MethodHead {
@@ -502,6 +530,56 @@ func (s *s3srv) getObject(w http.ResponseWriter, r *http.Request, bucket, key st
 	setObjectHeaders(w, obj, st, exp, found)
 	// ServeContent handles Content-Length, ranges, and HEAD no-body.
 	http.ServeContent(w, r, key, obj.CreatedAt, f)
+	return nil
+}
+
+// getMultipart serves a multipart object: HEAD with metadata, GET by
+// concatenating the materialized part files (the merge lives in the
+// concat reader; the parts themselves never coalesce on disk/tape).
+func (s *s3srv) getMultipart(w http.ResponseWriter, r *http.Request, obj *Object, key string) error {
+	parts, err := listParts(s.db, obj.ID)
+	if err != nil {
+		return err
+	}
+	paths := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p.DiskPath == "" {
+			paths = nil
+			break
+		}
+		paths = append(paths, p.DiskPath)
+	}
+	if paths == nil {
+		if obj.StorageClass == "GLACIER" || obj.StorageClass == "DEEP_ARCHIVE" {
+			st, exp, found, err := activeRetrieve(s.db, obj.ID)
+			if err != nil {
+				return err
+			}
+			if r.Method == http.MethodHead {
+				setObjectHeaders(w, obj, st, exp, found)
+				w.Header().Set("Content-Length", strconv.FormatInt(obj.Size, 10))
+				w.WriteHeader(http.StatusOK)
+				return nil
+			}
+			return errS3("InvalidObjectState",
+				"The operation is not valid for the object's storage class ("+obj.StorageClass+") — run restore-object first",
+				http.StatusForbidden)
+		}
+		return errS3("InvalidObjectState",
+			"parts are still being archived — wait for the worker pass, or run restore-object",
+			http.StatusForbidden)
+	}
+	st, exp, found, err := activeRetrieve(s.db, obj.ID)
+	if err != nil {
+		return err
+	}
+	c, err := newConcatReadSeeker(paths)
+	if err != nil {
+		return err
+	}
+	defer c.Close()
+	setObjectHeaders(w, obj, st, exp, found)
+	http.ServeContent(w, r, key, obj.CreatedAt, c)
 	return nil
 }
 
@@ -550,3 +628,413 @@ func (s *s3srv) restoreObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	return nil
 }
 
+
+// ---- multipart uploads ----
+// Parts stay parts on disk and tape (each part one atomic tape file);
+// GET merges at the API layer by concatenating parts in order. Parts
+// archive as they arrive, so a tar-pipe larger than the buffer disk
+// streams to tape while the upload is still running.
+
+// awsChunkedReader decodes the aws-chunked framing that awscli uses
+// for streaming uploads (x-amz-content-sha256: STREAMING-AWS4-...):
+// "<hex-size>[;chunk-signature=hex]\r\n<data>\r\n" repeated, "0...\r\n"
+// to finish. Go's http server does not strip this application-layer
+// encoding; without it every part would carry ~54 bytes of framing.
+type awsChunkedReader struct {
+	br        *bufio.Reader
+	remaining int64
+	done      bool
+}
+
+func newAwsChunkedReader(r io.Reader) *awsChunkedReader {
+	return &awsChunkedReader{br: bufio.NewReader(r)}
+}
+
+func (c *awsChunkedReader) Read(p []byte) (int, error) {
+	for c.remaining == 0 && !c.done {
+		line, err := c.br.ReadString('\n')
+		if err != nil {
+			return 0, io.ErrUnexpectedEOF
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		sizeStr, _, _ := strings.Cut(line, ";")
+		n, perr := strconv.ParseInt(sizeStr, 16, 64)
+		if perr != nil {
+			return 0, fmt.Errorf("bad aws-chunked size %q", line)
+		}
+		if n == 0 {
+			c.done = true
+			break
+		}
+		c.remaining = n
+	}
+	if c.done {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if int64(len(p)) > c.remaining {
+		p = p[:c.remaining]
+	}
+	n, err := c.br.Read(p)
+	c.remaining -= int64(n)
+	return n, err
+}
+
+// requestBody returns the decoded request body (aws-chunked framing
+// stripped when the client streamed it).
+func requestBody(r *http.Request) io.Reader {
+	if strings.HasPrefix(r.Header.Get("x-amz-content-sha256"), "STREAMING") {
+		return newAwsChunkedReader(r.Body)
+	}
+	return r.Body
+}
+
+type initiateMultipartResult struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadID string   `xml:"UploadId"`
+}
+
+func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	if _, err := bucketIDByName(s.db, bucket); err != nil {
+		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+	}
+	raw := make([]byte, 16)
+	if _, err := rand.Read(raw); err != nil {
+		return err
+	}
+	uploadID := hex.EncodeToString(raw)
+	if err := createUpload(s.db, bucket, key, uploadID); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	return xml.NewEncoder(w).Encode(initiateMultipartResult{
+		Xmlns: s3XMLNS, Bucket: bucket, Key: key, UploadID: uploadID})
+}
+
+// putPart streams one part to the buffer, hashes it (md5 = S3 part
+// ETag, sha256 = restore verifier), records it, and queues the part
+// for tape in the bucket's pool — the upload may still be streaming.
+func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	pool, err := bucketPool(s.db, bucket)
+	if err != nil {
+		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
+	}
+	uploadID := r.URL.Query().Get("uploadId")
+	part, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
+	if err != nil || part < 1 || part > 10000 {
+		return errS3("InvalidArgument", "partNumber must be 1-10000", http.StatusBadRequest)
+	}
+	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	if err != nil {
+		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	if err := os.MkdirAll(s.cfg.BufferDir, 0o755); err != nil {
+		return err
+	}
+	dst := filepath.Join(s.cfg.BufferDir, fmt.Sprintf("part-%d-%05d", objID, part))
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	mh, sh := md5.New(), sha256.New()
+	size, err := io.Copy(io.MultiWriter(f, mh, sh), requestBody(r))
+	cerr := f.Close()
+	if err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	if cerr != nil {
+		_ = os.Remove(dst)
+		return cerr
+	}
+	if size == 0 {
+		_ = os.Remove(dst)
+		return errS3("EntityTooSmall", "part size must be > 0 (S3 minimum is 5MB for non-final parts)", http.StatusBadRequest)
+	}
+	if err := insertPart(s.db, objID, part, size,
+		hex.EncodeToString(mh.Sum(nil)), hex.EncodeToString(sh.Sum(nil)), dst); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	if err := createArchiveRequest(s.db, objID, pool, part); err != nil {
+		return err
+	}
+	w.Header().Set("ETag", `"`+hex.EncodeToString(mh.Sum(nil))+`"`)
+	w.WriteHeader(http.StatusOK)
+	return nil
+}
+
+type completePartXML struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+type completeMultipartXML struct {
+	XMLName xml.Name           `xml:"CompleteMultipartUpload"`
+	Parts   []completePartXML `xml:"Part"`
+}
+
+type completeMultipartResult struct {
+	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Location string   `xml:"Location"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag"`
+}
+
+func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	uploadID := r.URL.Query().Get("uploadId")
+	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	if err != nil {
+		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	var req completeMultipartXML
+	if err := xml.Unmarshal(body, &req); err != nil {
+		return errS3("MalformedXML", "could not parse CompleteMultipartUpload", http.StatusBadRequest)
+	}
+	if len(req.Parts) == 0 {
+		return errS3("MalformedXML", "no parts listed", http.StatusBadRequest)
+	}
+	parts, err := listParts(s.db, objID)
+	if err != nil {
+		return err
+	}
+	byNumber := make(map[int]PartRow, len(parts))
+	for _, p := range parts {
+		byNumber[p.Number] = p
+	}
+	// S3 semantics: only the listed parts become the object; catalog
+	// parts not listed are dropped (their tape files, if written,
+	// become dead space).
+	listed := make(map[int]bool, len(req.Parts))
+	for _, lp := range req.Parts {
+		p, ok := byNumber[lp.PartNumber]
+		if !ok {
+			return errS3("InvalidPart", fmt.Sprintf("part %d was not uploaded", lp.PartNumber), http.StatusBadRequest)
+		}
+		if et := strings.Trim(lp.ETag, `"`); et != "" && !strings.EqualFold(et, p.MD5) {
+			return errS3("InvalidPart", fmt.Sprintf("part %d ETag mismatch (got %s, have %s)", lp.PartNumber, lp.ETag, p.MD5), http.StatusBadRequest)
+		}
+		var st string
+		qerr := s.db.QueryRow(`SELECT state FROM archive_requests
+			WHERE object_id = $1 AND part_number = $2
+			ORDER BY id DESC LIMIT 1`, objID, lp.PartNumber).Scan(&st)
+		if errors.Is(qerr, sql.ErrNoRows) {
+			return errS3("InvalidPart", fmt.Sprintf("part %d has no archive request", lp.PartNumber), http.StatusBadRequest)
+		}
+		if qerr != nil {
+			return qerr
+		}
+		if st == "failed" {
+			return errS3("InvalidPart", fmt.Sprintf("part %d failed to archive: see the request error", lp.PartNumber), http.StatusBadRequest)
+		}
+		listed[lp.PartNumber] = true
+	}
+	for _, p := range parts {
+		if !listed[p.Number] {
+			if _, err := s.db.Exec(`DELETE FROM archive_requests
+				WHERE object_id = $1 AND part_number = $2 AND state IN ('pending','assigned')`, objID, p.Number); err != nil {
+				return err
+			}
+			if _, err := s.db.Exec(`DELETE FROM tape_files WHERE object_id = $1 AND part_number = $2`, objID, p.Number); err != nil {
+				return err
+			}
+			if p.DiskPath != "" {
+				_ = os.Remove(p.DiskPath)
+			}
+			if _, err := s.db.Exec(`DELETE FROM object_parts WHERE object_id = $1 AND part_number = $2`, objID, p.Number); err != nil {
+				return err
+			}
+		}
+	}
+	// v0 has no overwrite: the completed key must be free.
+	if _, err := getObjectIn(s.db, bucket, key); err == nil {
+		return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
+	}
+	// S3-style multipart ETag: md5 of the concatenated binary part md5s.
+	h := md5.New()
+	var total int64
+	for _, lp := range req.Parts {
+		p := byNumber[lp.PartNumber]
+		raw, _ := hex.DecodeString(p.MD5)
+		h.Write(raw)
+		total += p.Size
+	}
+	etag := hex.EncodeToString(h.Sum(nil)) + "-" + strconv.Itoa(len(req.Parts))
+	if err := completeUpload(s.db, objID, etag); err != nil {
+		return err
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	return xml.NewEncoder(w).Encode(completeMultipartResult{
+		Xmlns:    s3XMLNS,
+		Location: "http://" + r.Host + "/" + bucket + "/" + key,
+		Bucket:   bucket, Key: key, ETag: etag,
+	})
+}
+
+func (s *s3srv) abortMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	uploadID := r.URL.Query().Get("uploadId")
+	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	if err != nil {
+		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	// Parts already written to tape become dead space (v0 has no
+	// reclamation); every catalog trace goes away.
+	parts, _ := listParts(s.db, objID)
+	for _, p := range parts {
+		if p.DiskPath != "" {
+			_ = os.Remove(p.DiskPath)
+		}
+	}
+	if _, err := s.db.Exec(`DELETE FROM tape_files WHERE object_id = $1`, objID); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM archive_requests WHERE object_id = $1`, objID); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM objects WHERE id = $1`, objID); err != nil {
+		return err
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return nil
+}
+
+type listPartsResult struct {
+	XMLName  xml.Name `xml:"ListPartsResult"`
+	Xmlns    string   `xml:"xmlns,attr"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadID string   `xml:"UploadId"`
+	Parts    []struct {
+		PartNumber   int    `xml:"PartNumber"`
+		ETag         string `xml:"ETag"`
+		Size         int64  `xml:"Size"`
+		LastModified string `xml:"LastModified"`
+	} `xml:"Part"`
+}
+
+func (s *s3srv) listUploadParts(w http.ResponseWriter, r *http.Request, bucket, key string) error {
+	uploadID := r.URL.Query().Get("uploadId")
+	objID, err := objectByUpload(s.db, bucket, key, uploadID)
+	if err != nil {
+		return errS3("NoSuchUpload", "upload does not exist", http.StatusNotFound)
+	}
+	parts, err := listParts(s.db, objID)
+	if err != nil {
+		return err
+	}
+	out := listPartsResult{Xmlns: s3XMLNS, Bucket: bucket, Key: key, UploadID: uploadID}
+	for _, p := range parts {
+		out.Parts = append(out.Parts, struct {
+			PartNumber   int    `xml:"PartNumber"`
+			ETag         string `xml:"ETag"`
+			Size         int64  `xml:"Size"`
+			LastModified string `xml:"LastModified"`
+		}{p.Number, p.MD5, p.Size, time.Now().UTC().Format(time.RFC3339)})
+	}
+	w.Header().Set("Content-Type", "application/xml")
+	return xml.NewEncoder(w).Encode(out)
+}
+
+// concatReadSeeker reads across an ordered list of part files as one
+// virtual file — the multipart merge, including Range requests via
+// http.ServeContent.
+type concatReadSeeker struct {
+	parts []*os.File
+	sizes []int64
+	pos   int64
+}
+
+func newConcatReadSeeker(paths []string) (*concatReadSeeker, error) {
+	c := &concatReadSeeker{}
+	for _, p := range paths {
+		f, err := os.Open(p)
+		if err != nil {
+			c.Close()
+			return nil, err
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			c.Close()
+			return nil, err
+		}
+		c.parts = append(c.parts, f)
+		c.sizes = append(c.sizes, fi.Size())
+	}
+	return c, nil
+}
+
+func (c *concatReadSeeker) Close() {
+	for _, f := range c.parts {
+		_ = f.Close()
+	}
+	c.parts = nil
+}
+
+func (c *concatReadSeeker) total() int64 {
+	var t int64
+	for _, s := range c.sizes {
+		t += s
+	}
+	return t
+}
+
+func (c *concatReadSeeker) Read(p []byte) (int, error) {
+	if c.pos >= c.total() {
+		return 0, io.EOF
+	}
+	// locate the part containing pos
+	var base int64
+	for i, s := range c.sizes {
+		if c.pos < base+s {
+			n, err := c.parts[i].Read(p)
+			c.pos += int64(n)
+			return n, err
+		}
+		base += s
+	}
+	return 0, io.EOF
+}
+
+func (c *concatReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	total := c.total()
+	var target int64
+	switch whence {
+	case io.SeekStart:
+		target = offset
+	case io.SeekCurrent:
+		target = c.pos + offset
+	case io.SeekEnd:
+		target = total + offset
+	}
+	if target < 0 {
+		return 0, fmt.Errorf("negative seek")
+	}
+	c.pos = target
+	// position the underlying file
+	var base int64
+	for i, s := range c.sizes {
+		if c.pos < base+s || c.pos == total && i == len(c.sizes)-1 {
+			if _, err := c.parts[i].Seek(c.pos-base, io.SeekStart); err != nil {
+				return 0, err
+			}
+			break
+		}
+		base += s
+	}
+	return c.pos, nil
+}
