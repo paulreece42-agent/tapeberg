@@ -163,8 +163,8 @@ func isUniqueViolation(err error) bool {
 
 // ---- archive queue ----
 
-func createArchiveRequest(db *sql.DB, objectID int64) error {
-	_, err := db.Exec(`INSERT INTO archive_requests (object_id) VALUES ($1)`, objectID)
+func createArchiveRequest(db *sql.DB, objectID int64, pool string) error {
+	_, err := db.Exec(`INSERT INTO archive_requests (object_id, pool) VALUES ($1, $2)`, objectID, pool)
 	return err
 }
 
@@ -176,11 +176,11 @@ type ArchiveReq struct {
 	DiskPath string
 }
 
-func pendingArchives(db *sql.DB) ([]ArchiveReq, error) {
+func pendingArchives(db *sql.DB, pool string) ([]ArchiveReq, error) {
 	rows, err := db.Query(`
 		SELECT r.id, r.object_id, o.key, o.size_bytes, o.disk_path
 		FROM archive_requests r JOIN objects o ON o.id = r.object_id
-		WHERE r.state = 'pending' ORDER BY r.requested_at`)
+		WHERE r.state = 'pending' AND r.pool = $1 ORDER BY r.requested_at`, pool)
 	if err != nil {
 		return nil, err
 	}
@@ -205,20 +205,23 @@ type Tape struct {
 	WrittenBytes  int64
 }
 
-// pickTape chooses the most-written active tape that nominally still fits
-// the object (fills tapes in sequence, CTA-style); ties break to the
-// lowest tape id so the fill order is deterministic; falls back to the
-// least-written one and lets the drive's EOM be the judge.
-func pickTape(db *sql.DB, size int64) (*Tape, error) {
-	q := `SELECT id, barcode, capacity_bytes, written_bytes
-		FROM tapes WHERE state = 'active' AND NOT is_cleaning
-		  AND written_bytes + $1 <= capacity_bytes
-		ORDER BY written_bytes %s, id ASC LIMIT 1`
+// pickTape chooses, from the configured pool, the most-written active
+// tape that nominally still fits the object (fills tapes in sequence,
+// CTA-style); ties break to the lowest tape id so the fill order is
+// deterministic; falls back to the least-written one and lets the
+// drive's EOM be the judge. Pool isolation keeps one rig's tapes (e.g.
+// an mhvtl dev library) invisible to another's worker.
+func pickTape(db *sql.DB, pool string, size int64) (*Tape, error) {
+	q := `SELECT t.id, t.barcode, t.capacity_bytes, t.written_bytes
+		FROM tapes t JOIN tape_pools p ON p.id = t.pool_id
+		WHERE p.name = $2 AND t.state = 'active' AND NOT t.is_cleaning
+		  AND t.written_bytes + $1 <= t.capacity_bytes
+		ORDER BY t.written_bytes %s, t.id ASC LIMIT 1`
 	t := &Tape{}
-	err := db.QueryRow(fmt.Sprintf(q, "DESC"), size).
+	err := db.QueryRow(fmt.Sprintf(q, "DESC"), size, pool).
 		Scan(&t.ID, &t.Barcode, &t.CapacityBytes, &t.WrittenBytes)
 	if errors.Is(err, sql.ErrNoRows) {
-		err = db.QueryRow(fmt.Sprintf(q, "ASC"), size).
+		err = db.QueryRow(fmt.Sprintf(q, "ASC"), size, pool).
 			Scan(&t.ID, &t.Barcode, &t.CapacityBytes, &t.WrittenBytes)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
@@ -284,8 +287,8 @@ func objectToStandard(db *sql.DB, objectID int64, path string) error {
 
 // ---- restore queue ----
 
-func createRetrieveRequest(db *sql.DB, objectID int64, days int) error {
-	_, err := db.Exec(`INSERT INTO retrieve_requests (object_id, pin_days) VALUES ($1, $2)`, objectID, days)
+func createRetrieveRequest(db *sql.DB, objectID int64, days int, pool string) error {
+	_, err := db.Exec(`INSERT INTO retrieve_requests (object_id, pin_days, pool) VALUES ($1, $2, $3)`, objectID, days, pool)
 	return err
 }
 
@@ -297,11 +300,11 @@ type RetrieveReq struct {
 	PinDays  int
 }
 
-func pendingRetrieves(db *sql.DB) ([]RetrieveReq, error) {
+func pendingRetrieves(db *sql.DB, pool string) ([]RetrieveReq, error) {
 	rows, err := db.Query(`
 		SELECT r.id, r.object_id, o.key, COALESCE(o.sha256, ''), r.pin_days
 		FROM retrieve_requests r JOIN objects o ON o.id = r.object_id
-		WHERE r.state = 'pending' ORDER BY r.requested_at`)
+		WHERE r.state = 'pending' AND r.pool = $1 ORDER BY r.requested_at`, pool)
 	if err != nil {
 		return nil, err
 	}

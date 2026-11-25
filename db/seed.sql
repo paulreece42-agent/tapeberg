@@ -11,11 +11,13 @@ INSERT INTO buckets (name) VALUES ('tapeberg')
 ON CONFLICT (name) DO NOTHING;
 
 -- The 16 data tapes + 1 cleaning tape from deploy/mhvtl/library_contents.10.
+-- They live in the 'vtl' pool — pool isolation keeps the dev rig's
+-- fixture tapes invisible to the real rig's worker (pool 'default').
 -- capacity 104857600 = 100 MiB nominal (CAPACITY=100 in mhvtl.conf; the
 -- drive's EOM sense is authoritative — see docs/dev-rig.md).
 INSERT INTO tapes (barcode, pool_id, is_cleaning, capacity_bytes)
 SELECT barcode,
-       (SELECT id FROM tape_pools WHERE name = 'default'),
+       (SELECT id FROM tape_pools WHERE name = 'vtl'),
        barcode LIKE 'CLN%',
        104857600
 FROM unnest(ARRAY[

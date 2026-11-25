@@ -531,7 +531,7 @@ func (s *s3srv) restoreObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	if found {
 		return errS3("RestoreAlreadyInProgress", "object restore is already in progress", http.StatusConflict)
 	}
-	if err := createRetrieveRequest(s.db, obj.ID, days); err != nil {
+	if err := createRetrieveRequest(s.db, obj.ID, days, s.cfg.Pool); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusAccepted)

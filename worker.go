@@ -21,6 +21,7 @@ type Config struct {
 	ChangerMode string
 	ChangerDev  string
 	AckDir      string
+	Pool        string // tape pool this rig draws from (isolation)
 	S3Listen    string
 	S3Key       string
 	S3Secret    string
@@ -60,7 +61,7 @@ func RunWorker(cfg Config) error {
 // re-queued; partial data (no filemark) is overwritten by the next write.
 func drainArchives(db *sql.DB, cfg Config, ch Changer) error {
 	for {
-		reqs, err := pendingArchives(db)
+		reqs, err := pendingArchives(db, cfg.Pool)
 		if err != nil {
 			return err
 		}
@@ -75,7 +76,7 @@ func drainArchives(db *sql.DB, cfg Config, ch Changer) error {
 
 func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 	for try := 0; try < 8; try++ {
-		tape, err := pickTape(db, req.Size)
+		tape, err := pickTape(db, cfg.Pool, req.Size)
 		if err != nil {
 			return failArchive(db, req.ID, err.Error())
 		}
@@ -132,7 +133,7 @@ func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 // the tape's bytes against the catalog's sha256 (pin-as-restore).
 func drainRestores(db *sql.DB, cfg Config, ch Changer) error {
 	for {
-		reqs, err := pendingRetrieves(db)
+		reqs, err := pendingRetrieves(db, cfg.Pool)
 		if err != nil {
 			return err
 		}

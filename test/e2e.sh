@@ -42,6 +42,7 @@ unset TAPEBERG_TELEGRAM_TOKEN TAPEBERG_TELEGRAM_CHAT TAPEBERG_WEBHOOK_URL TAPEBE
 export TAPEBERG_DRIVE="$DRIVE"
 export TAPEBERG_CHANGER=robot
 export TAPEBERG_CHANGER_DEV="$CHANGER_DEV"
+export TAPEBERG_POOL=vtl
 export TAPEBERG_BUFFER="$WORK/buffer"
 mkdir -p "$TAPEBERG_BUFFER"
 PSQL="psql $TAPEBERG_DB_URL -tAq"
@@ -58,11 +59,11 @@ for bc in TB0001L5 TB0002L5 TB0003L5; do
   mtx -f "$CHANGER_DEV" unload >/dev/null
 done
 
-say "resetting catalog to a clean slate"
+say "resetting catalog to a clean slate (vtl pool + e2e keys only — never the real rig's rows)"
 $PSQL -c "DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 'e2e-%');
 DELETE FROM archive_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 'e2e-%');
-DELETE FROM tape_files;
-UPDATE tapes SET state='active', written_bytes=0;
+DELETE FROM tape_files WHERE tape_id IN (SELECT id FROM tapes WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl'));
+UPDATE tapes SET state='active', written_bytes=0 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl');
 DELETE FROM objects WHERE key LIKE 'e2e-%';" >/dev/null
 
 say "generating 5 x 20MiB incompressible files (forces EOM + tape swap)"
@@ -72,8 +73,8 @@ done
 
 say "ingesting 5 objects"
 for i in 1 2 3 4 5; do "$BIN" ingest "$WORK/src$i" "e2e-file$i"; done
-n=$($PSQL -c "SELECT count(*) FROM archive_requests WHERE state='pending'")
-[ "$n" = 5 ] || fail "expected 5 pending archive requests, got $n"
+p=$($PSQL -c "SELECT count(*) FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE r.state='pending' AND o.key LIKE 'e2e-%'")
+[ "$p" = 5 ] || fail "expected 5 pending archive requests, got $p"
 
 say "worker pass 1: drain the archive queue"
 "$BIN" worker
@@ -86,7 +87,7 @@ s=$($PSQL -c "SELECT state FROM tapes WHERE barcode='TB0001L5'")
 [ "$s" = full ] || fail "TB0001L5 should be state=full after EOM, got '$s'"
 w=$($PSQL -c "SELECT count(*) FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE r.state='written' AND o.key LIKE 'e2e-%'")
 [ "$w" = 5 ] || fail "expected 5 written e2e requests, got $w"
-g=$($PSQL -c "SELECT count(*) FROM objects WHERE storage_class='GLACIER'")
+g=$($PSQL -c "SELECT count(*) FROM objects WHERE storage_class='GLACIER' AND key LIKE 'e2e-%'")
 [ "$g" = 5 ] || fail "expected 5 GLACIER objects, got $g"
 [ ! -e "$TAPEBERG_BUFFER/e2e-file1" ] || fail "disk copies should be dropped after archive"
 echo "4 objects on TB0001L5 (EOM-retried), 1 on TB0002L5 — swap verified"
