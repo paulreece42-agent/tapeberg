@@ -1,0 +1,26 @@
+# Tapeberg S3 endpoint — Glacier wire protocol on LTO tape.
+#
+# Install with:
+#   sudo install -o root -g root -m 644 deploy/tapeberg-s3.service /etc/systemd/system/tapeberg-s3.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tapeberg-s3
+#
+# The binary loads its own config from /etc/tapeberg.conf (db_url,
+# drive, buffer, changer, telegram creds, part size policy, ...), so
+# no Environment= lines are needed here. deploy/install-latest.sh
+# try-restarts this unit after replacing the binary, keeping the
+# endpoint on the latest merged code without manual steps.
+[Unit]
+Description=Tapeberg S3 endpoint (Glacier-compatible object archive)
+After=network-online.target postgresql.service
+Wants=network-online.target
+After=postgresql.service
+
+[Service]
+ExecStart=/usr/local/bin/tapeberg s3
+Restart=always
+RestartSec=3
+# Tape and buffer I/O is root-owned on the reference rig.
+User=root
+
+[Install]
+WantedBy=multi-user.target

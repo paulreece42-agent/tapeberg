@@ -42,3 +42,13 @@ install -m 0755 -o root -g root "$work/tapeberg" "$BIN.new"
 mv "$BIN.new" "$BIN"                       # atomic swap: no half-written bin
 echo "$head" > "$STAMP"
 echo "$(date -Is) install-latest: installed $(git log -1 --format='%h %s' "$head") -> $BIN"
+
+# If the S3 endpoint runs under systemd, pick up the new binary now —
+# a long-lived daemon would otherwise keep serving the old one.
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^tapeberg-s3\.service'; then
+  if systemctl try-restart tapeberg-s3.service; then
+    echo "$(date -Is) install-latest: restarted tapeberg-s3.service on the new binary"
+  else
+    echo "$(date -Is) install-latest: WARNING: tapeberg-s3.service try-restart failed; restart it manually"
+  fi
+fi
