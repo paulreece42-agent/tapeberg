@@ -763,6 +763,38 @@ func setPartDiskPath(db *sql.DB, objectID int64, number int, path string) error 
 
 // clearPartDiskPaths drops all restored/buffered part files (pin
 // expiry). Returns the removed paths.
+// abandonedUploads lists open multipart uploads older than ttlDays
+// (created but never completed or aborted — the S3 lifecycle
+// "AbortIncompleteMultipartUpload" behavior).
+func abandonedUploads(db *sql.DB, ttlDays int) ([]int64, error) {
+	rows, err := db.Query(`
+		SELECT id FROM objects
+		WHERE upload_id IS NOT NULL
+		  AND deleted_at IS NULL
+		  AND created_at < now() - ($1 || ' days')::interval
+		ORDER BY id`, ttlDays)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// objectKeyByID is for janitor logging.
+func objectKeyByID(db *sql.DB, objectID int64) (string, error) {
+	var key string
+	err := db.QueryRow(`SELECT key FROM objects WHERE id = $1`, objectID).Scan(&key)
+	return key, err
+}
+
 func clearPartDiskPaths(db *sql.DB, objectID int64) ([]string, error) {
 	rows, err := db.Query(`SELECT disk_path FROM object_parts
 		WHERE object_id = $1 AND disk_path IS NOT NULL`, objectID)

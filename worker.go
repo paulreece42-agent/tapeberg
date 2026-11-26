@@ -28,6 +28,11 @@ type Config struct {
 	// RepackThreshold is the dead-bytes percentage that makes the
 	// worker rewrite a tape (CTA-style repack). 0 disables.
 	RepackThreshold int
+	// UploadTTLDays is how long an open multipart upload may sit
+	// un-completed and un-aborted before the worker janitor
+	// tombstones it (S3 lifecycle "AbortIncompleteMultipartUpload").
+	// Default 7. 0 disables the sweep.
+	UploadTTLDays int
 	// Part size policy (multipart). Min applies to every part except
 	// the final one, enforced S3-style at CompleteMultipartUpload; max
 	// is enforced per UploadPart. On tape rigs raise the minimum —
@@ -72,7 +77,37 @@ func RunWorker(cfg Config) error {
 	if err := repackPass(db, cfg, ch); err != nil {
 		return err
 	}
+	if err := uploadSweep(db, cfg); err != nil {
+		return err
+	}
 	return expirySweep(db)
+}
+
+// uploadSweep tombstones multipart uploads that were started but
+// never completed or aborted — crashed clients, forgotten pipelines.
+// Same semantics as AbortMultipartUpload: queued part archives are
+// cancelled, buffered disk parts removed, parts already on tape become
+// dead bytes for repack.
+func uploadSweep(db *sql.DB, cfg Config) error {
+	if cfg.UploadTTLDays <= 0 {
+		return nil
+	}
+	ids, err := abandonedUploads(db, cfg.UploadTTLDays)
+	if err != nil || len(ids) == 0 {
+		return err
+	}
+	for _, id := range ids {
+		key, _ := objectKeyByID(db, id)
+		paths, err := softDeleteObject(db, id)
+		if err != nil {
+			return err
+		}
+		for _, p := range paths {
+			_ = os.Remove(p)
+		}
+		fmt.Printf("worker: abandoned multipart upload %q expired after %d day(s) — tombstoned\n", key, cfg.UploadTTLDays)
+	}
+	return nil
 }
 
 // drainArchives writes each pending object to tape, oldest first, filling

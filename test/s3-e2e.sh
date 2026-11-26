@@ -263,6 +263,30 @@ $AWS2 s3api abort-multipart-upload --bucket vtl --key s3e2e-partsize --upload-id
 [ "$($PSQL -c "SELECT count(*) FROM archive_requests a JOIN objects o ON o.id=a.object_id WHERE o.key='s3e2e-partsize' AND a.state IN ('pending','assigned')")" = 0 ] || fail "partsize abort must cancel its queued part archives"
 kill $SRV2_PID 2>/dev/null || true
 
+say "lifecycle: abandoned multipart uploads expire (worker janitor)"
+UPID3=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-mp-stale --query UploadId --output text)
+$AWS s3api upload-part --bucket vtl --key s3e2e-mp-stale --upload-id "$UPID3" --part-number 1 --body "$WORK/obj" >/dev/null || fail "upload-part (stale) failed"
+UPID4=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-mp-fresh --query UploadId --output text)
+$AWS s3api upload-part --bucket vtl --key s3e2e-mp-fresh --upload-id "$UPID4" --part-number 1 --body "$WORK/obj" >/dev/null || fail "upload-part (fresh) failed"
+# Age ONLY the stale one past the TTL (default 7 days).
+$PSQL -c "UPDATE objects SET created_at = now() - interval '8 days' WHERE key='s3e2e-mp-stale'" >/dev/null
+"$BIN" worker > "$WORK/janitor.log" 2>&1 || fail "worker failed running the upload janitor"
+grep -q "s3e2e-mp-stale.*tombstoned" "$WORK/janitor.log" || fail "janitor did not expire the stale upload: $(tail -2 "$WORK/janitor.log")"
+[ "$($PSQL -c "SELECT count(*) FROM objects WHERE key='s3e2e-mp-stale' AND deleted_at IS NOT NULL")" = 1 ] || fail "stale upload must be tombstoned"
+[ "$($PSQL -c "SELECT count(*) FROM archive_requests a JOIN objects o ON o.id=a.object_id WHERE o.key='s3e2e-mp-stale' AND a.state IN ('pending','assigned')")" = 0 ] || fail "janitor must cancel the stale upload's queued archives"
+[ "$($PSQL -c "SELECT count(*) FROM objects WHERE key='s3e2e-mp-fresh' AND deleted_at IS NULL AND upload_id IS NOT NULL")" = 1 ] || fail "fresh upload must NOT be expired"
+ls "$TAPEBERG_BUFFER"/part-$(  $PSQL -c "SELECT id FROM objects WHERE key='s3e2e-mp-stale'")-* 2>/dev/null | grep -q . && fail "janitor left the stale upload's buffered part on disk"
+$AWS s3api abort-multipart-upload --bucket vtl --key s3e2e-mp-fresh --upload-id "$UPID4" || fail "fresh upload cleanup abort failed"
+# Same as the abort section: undo the stale part's tape footprint so
+# later placement sections see the fill order they were designed for.
+$PSQL -c "UPDATE tapes SET written_bytes = written_bytes -
+        (SELECT COALESCE(sum(size_bytes),0) FROM tape_files
+          WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-stale'))
+        WHERE id IN (SELECT DISTINCT tape_id FROM tape_files
+          WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-stale'));
+        DELETE FROM tape_files WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-stale');
+        DELETE FROM object_shards WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-stale');" >/dev/null
+
 say "SigV4 is enforced (bad signature rejected)"
 if AWS_SECRET_ACCESS_KEY="wrong-secret" $AWS s3api list-buckets >/dev/null 2>&1; then
   fail "bad credentials were accepted"
