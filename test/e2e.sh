@@ -150,4 +150,13 @@ unset TAPEBERG_CHANGER TAPEBERG_ACK_DIR
 say "tapeberg status"
 TAPEBERG_CHANGER=robot "$BIN" status
 
+say "rm: soft delete from the CLI"
+head -c 1048576 /dev/urandom > "$WORK/rm-test"
+"$BIN" ingest "$WORK/rm-test" e2e-rm-test >/dev/null || fail "ingest e2e-rm-test failed"
+"$BIN" rm e2e-rm-test >/dev/null || fail "rm failed"
+if "$BIN" get e2e-rm-test >/dev/null 2>"$WORK/rmerr" 2>&1; then
+  fail "get on a deleted key must fail"
+fi
+[ "$($PSQL -c "SELECT count(*) FROM archive_requests WHERE state='pending' AND object_id IN (SELECT id FROM objects WHERE key='e2e-rm-test')")" = 0 ] || fail "rm must cancel pending archive requests"
+
 printf '\nE2E PASS — all basic functions verified\n'

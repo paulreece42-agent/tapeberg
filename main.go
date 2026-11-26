@@ -28,6 +28,7 @@ usage:
   tapeberg ingest <src-path> [key]   stage a file for archival (queues it)
   tapeberg restore <key> [days]      queue a Glacier-style restore (default 1 day, max 30)
   tapeberg get <key>                 cat a restored object to stdout
+  tapeberg rm <key>                  soft-delete an object (tape bytes reclaimed at repack)
   tapeberg tape add <barcode> [capacity]  register a tape in the catalog (capacity like 1500GB; default 1500GB, LTO-5)
   tapeberg user <subcommand>         manage S3 users (add/rm/ls/info/suspend/unsuspend; --full-name, --email, --admin)
   tapeberg key <subcommand>         manage S3 keys (add --uid, rm --access-key; users may hold several)
@@ -112,6 +113,12 @@ func run(args []string) error {
 
 	case "key":
 		return cmdKey(cfg, rest)
+
+	case "rm":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: tapeberg rm <key>")
+		}
+		return cmdRm(cfg, rest[0])
 
 	case "status":
 		return cmdStatus(cfg)
@@ -285,6 +292,15 @@ func envDefault(key, def string) string {
 	return def
 }
 
+func envIntDefault(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
 // parseCapacity accepts a byte count or a size with unit, e.g. 100MB,
 // 1500GB, 1.5TB, 128GiB. Bare numbers are bytes.
 func parseCapacity(s string) (int64, error) {
@@ -357,6 +373,7 @@ func LoadConfig() (Config, error) {
 		AckDir:      envDefault("TAPEBERG_ACK_DIR", "/run/tapeberg"),
 		Pool:        envDefault("TAPEBERG_POOL", "default"),
 		Auth:        envDefault("TAPEBERG_AUTH", "builtin"),
+		RepackThreshold: envIntDefault("TAPEBERG_REPACK_THRESHOLD", 50),
 		S3Listen:    envDefault("TAPEBERG_S3_LISTEN", ":7333"),
 		S3Key:       os.Getenv("TAPEBERG_S3_KEY"),
 		S3Secret:    os.Getenv("TAPEBERG_S3_SECRET"),
@@ -551,4 +568,31 @@ func cmdKey(cfg Config, args []string) error {
 	default:
 		return fmt.Errorf("unknown key subcommand %q (have: add rm)", args[0])
 	}
+}
+
+// cmdRm soft-deletes an object from the CLI's 'tapeberg' bucket —
+// same semantics as S3 DeleteObject: tombstone now, tape bytes
+// reclaimed when the worker's repack pass rewrites the tape.
+func cmdRm(cfg Config, key string) error {
+	db, err := openDB(cfg.DBURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	obj, err := getObjectIn(db, "tapeberg", key)
+	if err != nil {
+		fmt.Printf("%s: already gone (no such object)\n", key)
+		return nil
+	}
+	files, err := softDeleteObject(db, obj.ID)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		if f != "" {
+			_ = os.Remove(f)
+		}
+	}
+	fmt.Printf("%s: deleted (tombstoned; tape bytes reclaimed at repack)\n", key)
+	return nil
 }

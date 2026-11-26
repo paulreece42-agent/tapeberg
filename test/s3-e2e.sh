@@ -40,7 +40,7 @@ AWS="aws --endpoint-url http://127.0.0.1:7333 --region us-east-1"
 
 say "blanking VTL media + resetting catalog together (they MUST stay in sync)"
 mtx -f "$CHANGER_DEV" unload >/dev/null 2>&1 || true  # tolerate a leftover load
-for bc in TB0001L5 TB0002L5 TB0003L5; do
+for bc in TB0001L5 TB0002L5 TB0003L5 TB0004L5 TB0005L5 TB0006L5 TB0007L5 TB0008L5 TB0009L5 TB0010L5 TB0011L5 TB0012L5 TB0013L5 TB0014L5 TB0015L5 TB0016L5; do
   slot=$(mtx -f "$CHANGER_DEV" status | grep "VolumeTag=$bc" | sed 's/.*Storage Element \([0-9]*\):Full.*/\1/')
   mtx -f "$CHANGER_DEV" load "$slot" >/dev/null
   sleep 1
@@ -51,6 +51,7 @@ for bc in TB0001L5 TB0002L5 TB0003L5; do
 done
 $PSQL -c "DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objects WHERE bucket_id IN (SELECT id FROM buckets WHERE name='alice-bkt'));
 DELETE FROM archive_requests WHERE object_id IN (SELECT id FROM objects WHERE bucket_id IN (SELECT id FROM buckets WHERE name='alice-bkt'));
+DELETE FROM tape_files WHERE object_id IN (SELECT id FROM objects WHERE bucket_id IN (SELECT id FROM buckets WHERE name='alice-bkt'));
 DELETE FROM objects WHERE bucket_id IN (SELECT id FROM buckets WHERE name='alice-bkt');
 DELETE FROM buckets WHERE name='alice-bkt';
 DELETE FROM s3_users;
@@ -274,6 +275,45 @@ say "user rm; static key returns"
 "$BIN" user rm siteadmin
 export AWS_ACCESS_KEY_ID="$TAPEBERG_S3_KEY" AWS_SECRET_ACCESS_KEY="$TAPEBERG_S3_SECRET"
 $AWS s3api list-buckets >/dev/null || fail "static env key must work again once no users exist"
+
+say "delete: tombstone semantics (S3 DeleteObject + multipart)"
+# 50 + 36 MiB fits one tape's PHYSICAL capacity (~96 MiB for random
+# data — nominal is 100) so the pair co-locates; deleting del-a leaves
+# the tape 58% dead, over the repack threshold.
+dd if=/dev/urandom of="$WORK/del-a" bs=1M count=50 status=none
+dd if=/dev/urandom of="$WORK/del-b" bs=1M count=36 status=none
+$AWS s3api put-object --bucket vtl --key s3e2e-del-a --body "$WORK/del-a" >/dev/null || fail "put del-a failed"
+sleep 1 # distinct requested_at => strict FIFO (a tie once split the pair across tapes)
+$AWS s3api put-object --bucket vtl --key s3e2e-del-b --body "$WORK/del-b" >/dev/null || fail "put del-b failed"
+"$BIN" worker >/dev/null || fail "worker failed archiving del-a/del-b"
+OLD=$($PSQL -c "SELECT t.barcode FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-del-b'")
+OLD_A=$($PSQL -c "SELECT t.barcode FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-del-a'")
+[ "$OLD" = "$OLD_A" ] || fail "test design: del-a ($OLD_A) and del-b ($OLD) must co-locate for the repack assertion"
+$AWS s3api delete-object --bucket vtl --key s3e2e-del-a || fail "delete-object failed"
+$AWS s3api delete-object --bucket vtl --key s3e2e-tar-pipe || fail "multipart delete-object failed"
+if $AWS s3api head-object --bucket vtl --key s3e2e-del-a >/dev/null 2>&1; then
+  fail "deleted object must 404"
+fi
+$AWS s3api delete-object --bucket vtl --key s3e2e-del-a || fail "delete must be idempotent (204)"
+if $AWS s3api get-object --bucket vtl --key s3e2e-tar-pipe "$WORK/dead-mp" >/dev/null 2>&1; then
+  fail "deleted multipart object must not be readable"
+fi
+if $AWS s3api list-objects-v2 --bucket vtl --prefix s3e2e-del --query "Contents[].Key" --output text | grep -qw s3e2e-del-a; then
+  fail "deleted object must not be listed"
+fi
+$AWS s3api list-objects-v2 --bucket vtl --prefix s3e2e-del --query "Contents[].Key" --output text | grep -qw s3e2e-del-b || fail "surviving object must still be listed"
+
+say "repack: the year-3 rewrite (>= 50% dead reclaims the tape)"
+"$BIN" worker > "$WORK/repack.log" 2>&1 || fail "worker (repack pass) failed"
+grep -q "repack" "$WORK/repack.log" || fail "repack did not trigger: $(grep repack "$WORK/repack.log")"
+NEW=$($PSQL -c "SELECT t.barcode FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-del-b'")
+[ -n "$NEW" ] && [ "$NEW" != "$OLD" ] || fail "del-b should have moved tapes ($OLD -> '$NEW')"
+ST=$($PSQL -c "SELECT state FROM tapes WHERE barcode='$OLD'")
+[ "$ST" = retired ] || fail "emptied tape should be retired, got $ST"
+$AWS s3api restore-object --bucket vtl --key s3e2e-del-b --restore-request Days=1 || fail "restore of repacked object failed"
+"$BIN" worker >/dev/null || fail "worker failed restoring repacked object"
+$AWS s3api get-object --bucket vtl --key s3e2e-del-b "$WORK/del-b-out" >/dev/null || fail "get of repacked object failed"
+cmp "$WORK/del-b" "$WORK/del-b-out" || fail "repacked bytes differ from upload"
 
 kill $SRV_PID 2>/dev/null || true
 SRV_PID=""

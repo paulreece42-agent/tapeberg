@@ -24,6 +24,9 @@ type Config struct {
 	AckDir      string
 	Pool        string // tape pool this rig draws from (isolation)
 	Auth        string // auth backend: builtin (default), ldap/ad later
+	// RepackThreshold is the dead-bytes percentage that makes the
+	// worker rewrite a tape (CTA-style repack). 0 disables.
+	RepackThreshold int
 	S3Listen    string
 	S3Key       string
 	S3Secret    string
@@ -53,6 +56,9 @@ func RunWorker(cfg Config) error {
 		return err
 	}
 	if err := drainRestores(db, cfg, ch); err != nil {
+		return err
+	}
+	if err := repackPass(db, cfg, ch); err != nil {
 		return err
 	}
 	return expirySweep(db)
@@ -317,4 +323,110 @@ func expirySweep(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// repackPass rewrites tapes whose dead (deleted-object) share meets
+// TAPEBERG_REPACK_THRESHOLD (default 50%): every live file is read
+// from the source tape (sha-verified against the catalog), written to
+// another tape in the pool, and its placement row moved; the emptied
+// source is marked 'retired' (pickTape ignores it — erase and re-add
+// to reuse the media). Any read/verify failure aborts that tape's
+// repack and leaves it untouched — a suspect tape is never freed.
+func repackPass(db *sql.DB, cfg Config, ch Changer) error {
+	if cfg.RepackThreshold <= 0 {
+		return nil
+	}
+	cands, err := repackCandidates(db, cfg.Pool, cfg.RepackThreshold)
+	if err != nil {
+		return err
+	}
+	for _, src := range cands {
+		files, err := liveTapeFiles(db, src.ID)
+		if err != nil {
+			return err
+		}
+		if len(files) == 0 {
+			if err := markTapeRetired(db, src.ID); err != nil {
+				return err
+			}
+			fmt.Printf("worker: repack — %s is 100%% dead (%d bytes); retired\n", src.Barcode, src.Written)
+			continue
+		}
+		fmt.Printf("worker: repack — %s is %d%% dead (%d of %d bytes); moving %d live file(s)\n",
+			src.Barcode, src.Dead*100/src.Written, src.Dead, src.Written, len(files))
+		if err := ch.Load(src.Barcode); err != nil {
+			fmt.Printf("worker: repack — cannot load %s: %v (left as-is)\n", src.Barcode, err)
+			continue
+		}
+		aborted := false
+		for _, f := range files {
+			tmp := filepath.Join(cfg.BufferDir, fmt.Sprintf("repack-%d", f.TapeFileID))
+			sha, rerr := readTapeFile(cfg.Drive, f.PhysicalFile, tmp)
+			if rerr != nil {
+				fmt.Printf("worker: repack — %s file %d read failed: %v (tape left as-is)\n", src.Barcode, f.PhysicalFile, rerr)
+				aborted = true
+				break
+			}
+			if f.Sha256 != "" && sha != f.Sha256 {
+				fmt.Printf("worker: repack — %s file %d checksum mismatch: got %s, expected %s (tape SUSPECT, left as-is)\n",
+					src.Barcode, f.PhysicalFile, sha, f.Sha256)
+				aborted = true
+				break
+			}
+			if err := repackOneFile(db, cfg, ch, src.ID, &f, tmp); err != nil {
+				fmt.Printf("worker: repack — %s file %d: %v (tape left as-is)\n", src.Barcode, f.PhysicalFile, err)
+				aborted = true
+				break
+			}
+			_ = os.Remove(tmp)
+		}
+		if aborted {
+			_ = ch.Unload()
+			continue
+		}
+		if err := markTapeRetired(db, src.ID); err != nil {
+			return err
+		}
+		if err := ch.Unload(); err != nil {
+			return err
+		}
+		fmt.Printf("worker: repack — %s retired (%d bytes reclaimed; erase + re-add to reuse)\n", src.Barcode, src.Dead)
+	}
+	return nil
+}
+
+// repackOneFile re-archives one live file onto another tape and moves
+// its placement row.
+func repackOneFile(db *sql.DB, cfg Config, ch Changer, srcTape int64, f *LiveTapeFile, tmp string) error {
+	for try := 0; try < 8; try++ {
+		tape, err := pickTapeExcluding(db, cfg.Pool, f.Size, srcTape)
+		if err != nil {
+			return err
+		}
+		if err := ch.Load(tape.Barcode); err != nil {
+			return err
+		}
+		archiveID, err := nextArchiveID(db, tape.ID)
+		if err != nil {
+			return err
+		}
+		physical, werr := writeTapeFile(cfg.Drive, tmp)
+		if werr == ErrTapeFull {
+			if err := markTapeFull(db, tape.ID); err != nil {
+				return err
+			}
+			continue // target filled mid-write; overwrite the partial next round
+		}
+		if werr != nil {
+			return werr
+		}
+		if err := moveTapeFile(db, f.TapeFileID, tape.ID, f.ObjectID, f.PartNumber, archiveID, physical, f.Size); err != nil {
+			return err
+		}
+		if err := addTapeWritten(db, tape.ID, f.Size); err != nil {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("ran out of target tapes")
 }
