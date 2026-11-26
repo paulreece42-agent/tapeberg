@@ -1,4 +1,4 @@
-# Tapeberg worker — root cron, once a minute, single instance via flock.
+# Tapeberg worker — root cron, once a minute, single instance via the binary-internal flock.
 #
 # Install with:
 #   sudo install -o root -g root -m 644 deploy/tapeberg-worker.cron /etc/cron.d/tapeberg
@@ -7,4 +7,4 @@
 #
 # Adjust the drive/changer/buffer paths to your rig. TAPEBERG_DB_URL comes
 # from .env (keep it free of spaces and shell metacharacters).
-* * * * * root . /home/major/tapeberg/.env && TAPEBERG_DRIVE=/dev/nst1 TAPEBERG_CHANGER=robot TAPEBERG_BUFFER=/var/lib/tapeberg flock -n /run/tapeberg.lock /usr/local/bin/tapeberg worker >>/var/log/tapeberg.log 2>&1
+* * * * * root /usr/local/bin/tapeberg worker >>/var/log/tapeberg.log 2>&1

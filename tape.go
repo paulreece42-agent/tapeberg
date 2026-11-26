@@ -89,10 +89,25 @@ func writeTapeFile(dev, src string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	physical := fn + 1
 	if fn < 0 {
-		physical = 1 // blank tape: positioned before any file
+		// Position unknown (st reports -1 when no operation this open
+		// established it — e.g. the drive was already at EOD after a
+		// previous write). Force movement to re-establish, then
+		// re-probe; a wrong guess here poisons the catalog.
+		if err := mtRetry(dev, 5, "rewind"); err != nil {
+			return 0, err
+		}
+		if err := mtRetry(dev, 5, "eod"); err != nil {
+			return 0, err
+		}
+		if fn, err = tapeFileNumber(dev); err != nil {
+			return 0, err
+		}
+		if fn < 0 {
+			return 0, fmt.Errorf("cannot determine tape position after rewind+eod (status reports file -1)")
+		}
 	}
+	physical := fn + 1
 	in, err := os.Open(src)
 	if err != nil {
 		return 0, err
@@ -136,18 +151,9 @@ write:
 	return physical, nil
 }
 
-// readTapeFile positions the drive at file archiveID (1-based, counting
-// files from the beginning of the tape), streams it to dst, and returns
-// the file's sha256 hex digest. Reading stops at the filemark.
-func readTapeFile(dev string, archiveID int64, dst string) (string, error) {
-	if err := mtRetry(dev, 5, "rewind"); err != nil {
-		return "", err
-	}
-	if archiveID > 1 {
-		if err := mt(dev, "fsf", strconv.FormatInt(archiveID-1, 10)); err != nil {
-			return "", err
-		}
-	}
+// readCurrentFile streams the file at the current drive position to
+// dst until its filemark, returning the sha256 hex digest.
+func readCurrentFile(dev, dst string) (string, error) {
 	f, err := os.Open(dev)
 	if err != nil {
 		return "", err
@@ -184,4 +190,38 @@ read:
 		return "", rerr
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// readTapeFileAt positions the drive at physical file `target` (1-based,
+// counting every file on the tape) and streams it to dst. `cur` is the
+// file the drive is known to sit at the START of (0 = unknown). After a
+// read the drive sits exactly at the start of the next file, so when
+// cur+1 == target NO positioning happens — sequential parts stream
+// back-to-back with a single seek for the whole run instead of a
+// rewind+space per file (which re-shoes the drive for minutes on big
+// objects). Returns the new cur (== target) on success.
+func readTapeFileAt(dev string, target, cur int64, dst string) (string, int64, error) {
+	if !(cur > 0 && cur+1 == target) {
+		if err := mtRetry(dev, 5, "rewind"); err != nil {
+			return "", 0, err
+		}
+		if target > 1 {
+			if err := mt(dev, "fsf", strconv.FormatInt(target-1, 10)); err != nil {
+				return "", 0, err
+			}
+		}
+	}
+	sha, err := readCurrentFile(dev, dst)
+	if err != nil {
+		return "", 0, err
+	}
+	return sha, target, nil
+}
+
+// readTapeFile positions the drive at file archiveID (1-based, counting
+// files from the beginning of the tape), streams it to dst, and returns
+// the file's sha256 hex digest. Reading stops at the filemark.
+func readTapeFile(dev string, archiveID int64, dst string) (string, error) {
+	sha, _, err := readTapeFileAt(dev, archiveID, 0, dst)
+	return sha, err
 }

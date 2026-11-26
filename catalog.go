@@ -388,21 +388,33 @@ func softDeleteObject(db *sql.DB, objectID int64) (removedFiles []string, err er
 		WHERE object_id = $1 AND state IN ('pending','assigned')`, objectID); err != nil {
 		return nil, err
 	}
-	// Part disk copies too (multipart buffered or pinned).
-	rows, err := db.Query(`UPDATE object_parts SET disk_path = NULL
-		WHERE object_id = $1 AND disk_path IS NOT NULL RETURNING disk_path`, objectID)
+	// Part disk copies too (multipart buffered or pinned). SELECT the
+	// paths FIRST: RETURNING would report the post-UPDATE value (NULL,
+	// since we just nulled it) and the scan would fail — which leaked
+	// buffered part files on every delete/abort of an object whose
+	// parts were not yet on tape.
+	rows, err := db.Query(`SELECT disk_path FROM object_parts
+		WHERE object_id = $1 AND disk_path IS NOT NULL`, objectID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var p string
 		if err := rows.Scan(&p); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		removedFiles = append(removedFiles, p)
 	}
-	return removedFiles, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`UPDATE object_parts SET disk_path = NULL
+		WHERE object_id = $1 AND disk_path IS NOT NULL`, objectID); err != nil {
+		return nil, err
+	}
+	return removedFiles, nil
 }
 
 // RepackTape is a tape whose dead (deleted-object) share makes it
@@ -776,14 +788,17 @@ func setPartDiskPath(db *sql.DB, objectID int64, number int, path string) error 
 // expiry). Returns the removed paths.
 // abandonedUploads lists open multipart uploads older than ttlDays
 // (created but never completed or aborted — the S3 lifecycle
-// "AbortIncompleteMultipartUpload" behavior).
-func abandonedUploads(db *sql.DB, ttlDays int) ([]int64, error) {
+// "AbortIncompleteMultipartUpload" behavior), in this rig's pool only:
+// pool-scoped workers must not janitor another rig's uploads.
+func abandonedUploads(db *sql.DB, ttlDays int, pool string) ([]int64, error) {
 	rows, err := db.Query(`
-		SELECT id FROM objects
-		WHERE upload_id IS NOT NULL
-		  AND deleted_at IS NULL
-		  AND created_at < now() - ($1 || ' days')::interval
-		ORDER BY id`, ttlDays)
+		SELECT o.id FROM objects o
+		JOIN buckets b ON b.id = o.bucket_id
+		WHERE o.upload_id IS NOT NULL
+		  AND o.deleted_at IS NULL
+		  AND b.pool = $2
+		  AND o.created_at < now() - ($1 || ' days')::interval
+		ORDER BY o.id`, ttlDays, pool)
 	if err != nil {
 		return nil, err
 	}
@@ -945,14 +960,17 @@ type ExpiredRow struct {
 	DiskPath string
 }
 
-func expiredRestores(db *sql.DB) ([]ExpiredRow, error) {
+// expiredRestores lists pinned restores whose time is up, in this
+// rig's pool only (pool-scoped workers must not expire another
+// rig's pins).
+func expiredRestores(db *sql.DB, pool string) ([]ExpiredRow, error) {
 	rows, err := db.Query(`
 		SELECT r.id, r.object_id, COALESCE(o.disk_path,'')
 		FROM retrieve_requests r JOIN objects o ON o.id = r.object_id
-		WHERE r.state = 'restored' AND r.expires_at < now()
+		WHERE r.state = 'restored' AND r.expires_at < now() AND r.pool = $1
 		  AND (o.disk_path IS NOT NULL OR EXISTS (
 		    SELECT 1 FROM object_parts op
-		    WHERE op.object_id = o.id AND op.disk_path IS NOT NULL))`)
+		    WHERE op.object_id = o.id AND op.disk_path IS NOT NULL))`, pool)
 	if err != nil {
 		return nil, err
 	}
