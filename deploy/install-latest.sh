@@ -45,7 +45,10 @@ echo "$(date -Is) install-latest: installed $(git log -1 --format='%h %s' "$head
 
 # If the S3 endpoint runs under systemd, pick up the new binary now —
 # a long-lived daemon would otherwise keep serving the old one.
-if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^tapeberg-s3\.service'; then
+# NOTE: grep WITHOUT -q (piped to /dev/null): grep -q exits on first
+# match, systemctl then dies on SIGPIPE, and pipefail makes the whole
+# condition read false — the restart silently never happens.
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files --no-pager 2>/dev/null | grep '^tapeberg-s3\.service' >/dev/null; then
   if systemctl try-restart tapeberg-s3.service; then
     echo "$(date -Is) install-latest: restarted tapeberg-s3.service on the new binary"
   else
