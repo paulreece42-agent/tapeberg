@@ -30,6 +30,8 @@ usage:
   tapeberg get <key>                 cat a restored object to stdout
   tapeberg rm <key>                  soft-delete an object (tape bytes reclaimed at repack)
   tapeberg tape add <barcode> [capacity]  register a tape in the catalog (capacity like 1500GB; default 1500GB, LTO-5)
+  tapeberg pool ls                   list pools and their erasure-coding policy
+  tapeberg pool set <name> --ec-k 2 --ec-m 1   RAIT stripe per archive (or --no-ec)
   tapeberg user <subcommand>         manage S3 users (add/rm/ls/info/suspend/unsuspend; --full-name, --email, --admin)
   tapeberg key <subcommand>         manage S3 keys (add --uid, rm --access-key; users may hold several)
   tapeberg status                    catalog + queue summary
@@ -119,6 +121,9 @@ func run(args []string) error {
 			return fmt.Errorf("usage: tapeberg rm <key>")
 		}
 		return cmdRm(cfg, rest[0])
+
+	case "pool":
+		return cmdPool(cfg, rest)
 
 	case "status":
 		return cmdStatus(cfg)
@@ -301,6 +306,18 @@ func envIntDefault(key string, def int) int {
 	return def
 }
 
+// splitCSV splits a comma-separated env value (TAPEBERG_DRIVES); empty
+// entries dropped. Empty env → nil (single-drive rig).
+func splitCSV(v string) []string {
+	var out []string
+	for _, f := range strings.Split(v, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 // parseCapacity accepts a byte count or a size with unit, e.g. 100MB,
 // 1500GB, 1.5TB, 128GiB. Bare numbers are bytes.
 func parseCapacity(s string) (int64, error) {
@@ -374,6 +391,7 @@ func LoadConfig() (Config, error) {
 		Pool:        envDefault("TAPEBERG_POOL", "default"),
 		Auth:        envDefault("TAPEBERG_AUTH", "builtin"),
 		RepackThreshold: envIntDefault("TAPEBERG_REPACK_THRESHOLD", 50),
+		Drives:      splitCSV(os.Getenv("TAPEBERG_DRIVES")),
 		S3Listen:    envDefault("TAPEBERG_S3_LISTEN", ":7333"),
 		S3Key:       os.Getenv("TAPEBERG_S3_KEY"),
 		S3Secret:    os.Getenv("TAPEBERG_S3_SECRET"),
@@ -595,4 +613,71 @@ func cmdRm(cfg Config, key string) error {
 	}
 	fmt.Printf("%s: deleted (tombstoned; tape bytes reclaimed at repack)\n", key)
 	return nil
+}
+
+// cmdPool manages pool-level policy: the EC/RAIT stripe shape.
+func cmdPool(cfg Config, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: tapeberg pool ls | set <name> [--ec-k N --ec-m M | --no-ec]")
+	}
+	db, err := openDB(cfg.DBURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	switch args[0] {
+	case "ls":
+		rows, err := db.Query(`
+			SELECT p.name, COALESCE(p.ec_k, 0), COALESCE(p.ec_m, 0),
+			       (SELECT count(*) FROM tapes t WHERE t.pool_id = p.id)
+			FROM tape_pools p ORDER BY p.name`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			var k, m, tapes int
+			if err := rows.Scan(&name, &k, &m, &tapes); err != nil {
+				return err
+			}
+			ec := "single copy"
+			if k > 0 {
+				ec = fmt.Sprintf("RAIT %d+%d (loses %d, survives %d)", k, m, m, m)
+			}
+			fmt.Printf("%s\t%d tape(s)\t%s\n", name, tapes, ec)
+		}
+		return rows.Err()
+	case "set":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: tapeberg pool set <name> [--ec-k N --ec-m M | --no-ec]")
+		}
+		pool := args[1]
+		if hasFlag(args, "--no-ec") {
+			if err := setPoolEC(db, pool, 0, 0); err != nil {
+				return err
+			}
+			fmt.Printf("pool %s: erasure coding off (new archives are single-copy)\n", pool)
+			return nil
+		}
+		k, _ := flagValue(args, "--ec-k")
+		m, _ := flagValue(args, "--ec-m")
+		if k == "" || m == "" {
+			return fmt.Errorf("pool set needs --ec-k and --ec-m (or --no-ec)")
+		}
+		ki, err1 := strconv.Atoi(k)
+		mi, err2 := strconv.Atoi(m)
+		if err1 != nil || err2 != nil || ki < 1 || mi < 1 {
+			return fmt.Errorf("--ec-k and --ec-m must be positive integers")
+		}
+		if err := setPoolEC(db, pool, ki, mi); err != nil {
+			return err
+		}
+		fmt.Printf("pool %s: RAIT %d+%d — new archives stripe across %d distinct tapes; any %d tape losses survive\n",
+			pool, ki, mi, ki+mi, mi)
+		fmt.Println("note: the policy freezes onto each object at archive time; existing objects keep their shape")
+		return nil
+	default:
+		return fmt.Errorf("unknown pool subcommand %q (have: ls set)", args[0])
+	}
 }

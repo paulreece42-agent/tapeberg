@@ -446,17 +446,24 @@ type LiveTapeFile struct {
 	PhysicalFile int64
 	Size         int64
 	Sha256       string // object's (or part's) verifier
+	ShardNumber  int64  // >= 0 for RAIT shards, -1 for whole files
 }
 
 // liveTapeFiles lists the source tape's live files in write order.
+// The verifier is the SHARD's sha for RAIT shards (a shard's bytes do
+// not hash to the object's sha), the part's for multipart parts, and
+// the object's otherwise.
 func liveTapeFiles(db *sql.DB, tapeID int64) ([]LiveTapeFile, error) {
 	rows, err := db.Query(`
 		SELECT tf.id, tf.object_id, tf.part_number, tf.physical_file, tf.size_bytes,
-		       COALESCE(op.sha256, o.sha256)
+		       COALESCE(os.sha256, op.sha256, o.sha256), COALESCE(tf.shard_number, -1)
 		FROM tape_files tf
 		JOIN objects o ON o.id = tf.object_id
 		LEFT JOIN object_parts op
 		  ON op.object_id = tf.object_id AND op.part_number = tf.part_number
+		LEFT JOIN object_shards os
+		  ON os.object_id = tf.object_id AND os.part_number = tf.part_number
+		 AND os.shard_number = tf.shard_number
 		WHERE tf.tape_id = $1 AND o.deleted_at IS NULL
 		ORDER BY tf.physical_file`, tapeID)
 	if err != nil {
@@ -466,7 +473,7 @@ func liveTapeFiles(db *sql.DB, tapeID int64) ([]LiveTapeFile, error) {
 	var out []LiveTapeFile
 	for rows.Next() {
 		var f LiveTapeFile
-		if err := rows.Scan(&f.TapeFileID, &f.ObjectID, &f.PartNumber, &f.PhysicalFile, &f.Size, &f.Sha256); err != nil {
+		if err := rows.Scan(&f.TapeFileID, &f.ObjectID, &f.PartNumber, &f.PhysicalFile, &f.Size, &f.Sha256, &f.ShardNumber); err != nil {
 			return nil, err
 		}
 		out = append(out, f)
@@ -475,13 +482,143 @@ func liveTapeFiles(db *sql.DB, tapeID int64) ([]LiveTapeFile, error) {
 }
 
 // moveTapeFile records that a live file now lives at a new position:
-// delete the old placement row, insert the new one. The old bytes
-// become dead space on the source tape (which is being retired).
-func moveTapeFile(db *sql.DB, oldTapeFileID, tapeID, objectID, partNumber, archiveID, physicalFile, size int64) error {
+// delete the old placement row, insert the new one. Shards keep their
+// shard number. The old bytes become dead space on the source tape
+// (which is being retired).
+func moveTapeFile(db *sql.DB, oldTapeFileID, tapeID, objectID, partNumber, shardNumber, archiveID, physicalFile, size int64) error {
 	if _, err := db.Exec(`DELETE FROM tape_files WHERE id = $1`, oldTapeFileID); err != nil {
 		return err
 	}
+	if shardNumber >= 0 {
+		return insertShardTapeFile(db, tapeID, objectID, partNumber, shardNumber, archiveID, physicalFile, size)
+	}
 	return insertTapeFile(db, tapeID, objectID, partNumber, archiveID, physicalFile, size)
+}
+
+// ECConfig is a pool's (or frozen object's) erasure-coding policy:
+// k data + m parity shards, one shard per tape.
+type ECConfig struct{ K, M int }
+
+// poolEC reports the pool's EC policy (nil = no erasure coding).
+func poolEC(db *sql.DB, pool string) (*ECConfig, error) {
+	var k, m sql.NullInt64
+	err := db.QueryRow(`SELECT ec_k, ec_m FROM tape_pools WHERE name = $1`, pool).Scan(&k, &m)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("pool %q: %w", pool, ErrNotFound)
+	}
+	if err != nil || !k.Valid || !m.Valid {
+		return nil, err
+	}
+	return &ECConfig{K: int(k.Int64), M: int(m.Int64)}, nil
+}
+
+// setPoolEC sets (or clears, k=0) a pool's EC policy.
+func setPoolEC(db *sql.DB, pool string, k, m int) error {
+	if k == 0 {
+		_, err := db.Exec(`UPDATE tape_pools SET ec_k = NULL, ec_m = NULL WHERE name = $1`, pool)
+		return err
+	}
+	res, err := db.Exec(`UPDATE tape_pools SET ec_k = $2, ec_m = $3 WHERE name = $1`, pool, k, m)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("pool %q: %w", pool, ErrNotFound)
+	}
+	return nil
+}
+
+// objectEC is the EC policy frozen on the object at archive time.
+func objectEC(db *sql.DB, objectID int64) (*ECConfig, error) {
+	var k, m sql.NullInt64
+	err := db.QueryRow(`SELECT ec_k, ec_m FROM objects WHERE id = $1`, objectID).Scan(&k, &m)
+	if err != nil || !k.Valid || !m.Valid {
+		return nil, err
+	}
+	return &ECConfig{K: int(k.Int64), M: int(m.Int64)}, nil
+}
+
+func setObjectEC(db *sql.DB, objectID int64, k, m int) error {
+	_, err := db.Exec(`UPDATE objects SET ec_k = $2, ec_m = $3 WHERE id = $1`, objectID, k, m)
+	return err
+}
+
+// insertShardTapeFile records a shard placement (like insertTapeFile
+// plus the shard number).
+func insertShardTapeFile(db *sql.DB, tapeID, objectID, partNumber, shardNumber, archiveID, physicalFile, size int64) error {
+	_, err := db.Exec(`INSERT INTO tape_files
+		(tape_id, object_id, part_number, shard_number, archive_id, physical_file, size_bytes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		tapeID, objectID, partNumber, shardNumber, archiveID, physicalFile, size)
+	return err
+}
+
+func insertShardVerifier(db *sql.DB, objectID, part, shard int64, size int64, sha string) error {
+	_, err := db.Exec(`INSERT INTO object_shards
+		(object_id, part_number, shard_number, size_bytes, sha256) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (object_id, part_number, shard_number) DO NOTHING`,
+		objectID, part, shard, size, sha)
+	return err
+}
+
+// ShardPlacement is where one shard lives (and how to check it).
+type ShardPlacement struct {
+	TapeID       int64
+	Barcode      string
+	PhysicalFile int64
+	Size         int64
+	ShardNumber  int64
+	SHA256       string
+}
+
+// shardPlacements lists a part's shard placements, shard order.
+func shardPlacements(db *sql.DB, objectID, partNumber int64) ([]ShardPlacement, error) {
+	rows, err := db.Query(`
+		SELECT tf.tape_id, t.barcode, tf.physical_file, tf.size_bytes,
+		       tf.shard_number, os.sha256
+		FROM tape_files tf
+		JOIN tapes t ON t.id = tf.tape_id
+		JOIN object_shards os
+		  ON os.object_id = tf.object_id AND os.part_number = tf.part_number
+		 AND os.shard_number = tf.shard_number
+		WHERE tf.object_id = $1 AND tf.part_number = $2 AND tf.shard_number IS NOT NULL
+		ORDER BY tf.shard_number`, objectID, partNumber)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ShardPlacement
+	for rows.Next() {
+		var p ShardPlacement
+		if err := rows.Scan(&p.TapeID, &p.Barcode, &p.PhysicalFile, &p.Size, &p.ShardNumber, &p.SHA256); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// pickShardTarget chooses a tape for one shard: it must not be a tape
+// already picked for this stripe NOR one already holding a sibling
+// shard of the same object-part (two shards of one file on one tape
+// would halve RAIT's survivability).
+func pickShardTarget(db *sql.DB, pool string, size int64, exclude []int64, objectID, partNumber int64) (*Tape, error) {
+	q := `SELECT t.id, t.barcode, t.capacity_bytes, t.written_bytes
+		FROM tapes t JOIN tape_pools p ON p.id = t.pool_id
+		WHERE p.name = $2 AND t.state = 'active' AND NOT t.is_cleaning
+		  AND t.written_bytes + $1 <= t.capacity_bytes
+		  AND t.id <> ALL($3::bigint[])
+		  AND t.id NOT IN (
+		    SELECT tape_id FROM tape_files
+		    WHERE object_id = $4 AND part_number = $5 AND shard_number IS NOT NULL)
+		ORDER BY t.written_bytes DESC, t.id ASC LIMIT 1`
+	t := &Tape{}
+	err := db.QueryRow(q, size, pool, pq.Array(exclude), objectID, partNumber).
+		Scan(&t.ID, &t.Barcode, &t.CapacityBytes, &t.WrittenBytes)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("no distinct active tape in pool %q fits a %d-byte shard", pool, size)
+	}
+	return t, err
 }
 
 func addTapeWritten(db *sql.DB, tapeID, n int64) error {

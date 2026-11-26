@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,6 +28,10 @@ type Config struct {
 	// RepackThreshold is the dead-bytes percentage that makes the
 	// worker rewrite a tape (CTA-style repack). 0 disables.
 	RepackThreshold int
+	// Drives are all tape drives available to this rig, in DTE order
+	// (TAPEBERG_DRIVES). RAIT shard stripes write/read in parallel
+	// across them; the first entry is the single-drive path's drive.
+	Drives     []string
 	S3Listen    string
 	S3Key       string
 	S3Secret    string
@@ -83,6 +88,13 @@ func drainArchives(db *sql.DB, cfg Config, ch Changer) error {
 }
 
 func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
+	// RAIT: pools with an EC policy stripe every object/part across
+	// k+m distinct tapes instead of writing one whole-file copy.
+	if ec, err := poolEC(db, cfg.Pool); err != nil {
+		return err
+	} else if ec != nil {
+		return ecArchive(db, cfg, ch, req, ec)
+	}
 	for try := 0; try < 8; try++ {
 		tape, err := pickTape(db, cfg.Pool, req.Size)
 		if err != nil {
@@ -183,6 +195,13 @@ func restoreOne(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
 	} else if mp {
 		return restoreMultipart(db, cfg, ch, req)
 	}
+	// Erasure-coded single object: the "tape file" is a k+m shard
+	// stripe, any k of which rebuild the bytes.
+	if ec, err := objectEC(db, req.ObjectID); err != nil {
+		return err
+	} else if ec != nil {
+		return restoreOneEC(db, cfg, ch, req, ec)
+	}
 	tf, err := objectTapeFile(db, req.ObjectID)
 	if err != nil {
 		_ = failRetrieve(db, req.ID, err.Error())
@@ -224,12 +243,48 @@ func restoreOne(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
 	return nil
 }
 
+// restoreOneEC rebuilds a single erasure-coded object from its shard
+// stripe (with parity reconstruction when shards are missing).
+func restoreOneEC(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq, ec *ECConfig) error {
+	var size int64
+	if err := db.QueryRow(`SELECT size_bytes FROM objects WHERE id = $1`, req.ObjectID).Scan(&size); err != nil {
+		return err
+	}
+	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
+		return err
+	}
+	dst := filepath.Join(cfg.BufferDir, req.Key)
+	// Single EC object: one stripe across k+m tapes. The archive request
+	// carried part_number 1 (no parts table rows — the multipart
+	// default), and the placements live under that part.
+	if err := ecRestorePart(db, cfg, ch, req.ObjectID, 1, ec, size, req.SHA256, dst); err != nil {
+		_ = os.Remove(dst)
+		_ = failRetrieve(db, req.ID, "RAIT restore: "+err.Error())
+		return nil
+	}
+	if err := objectToStandard(db, req.ObjectID, dst); err != nil {
+		return err
+	}
+	if err := restoreComplete(db, req.ID, time.Now().AddDate(0, 0, req.PinDays)); err != nil {
+		return err
+	}
+	fmt.Printf("worker: restored %s from RAIT %d+%d stripe (pinned %d days)\n", req.Key, ec.K, ec.M, req.PinDays)
+	return nil
+}
+
 // restoreMultipart materializes every part of a multipart object,
 // verifying each part's sha256 against the catalog. Parts may live on
 // different tapes — the changer swaps as needed (and skips swaps when
 // consecutive parts share a tape). The S3/CLI read layer concatenates
 // the part files in order; they are the merge.
 func restoreMultipart(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
+	// Erasure-coded multipart: each part is its own shard stripe
+	// (tape_files rows are shards, not the part itself).
+	if ec, err := objectEC(db, req.ObjectID); err != nil {
+		return err
+	} else if ec != nil {
+		return restoreMultipartEC(db, cfg, ch, req, ec)
+	}
 	parts, err := multipartTapeFiles(db, req.ObjectID)
 	if err != nil {
 		return err
@@ -396,10 +451,17 @@ func repackPass(db *sql.DB, cfg Config, ch Changer) error {
 }
 
 // repackOneFile re-archives one live file onto another tape and moves
-// its placement row.
+// its placement row. RAIT shards pick targets through pickShardTarget
+// so a repacked shard never lands on a sibling shard's tape.
 func repackOneFile(db *sql.DB, cfg Config, ch Changer, srcTape int64, f *LiveTapeFile, tmp string) error {
 	for try := 0; try < 8; try++ {
-		tape, err := pickTapeExcluding(db, cfg.Pool, f.Size, srcTape)
+		var tape *Tape
+		var err error
+		if f.ShardNumber >= 0 {
+			tape, err = pickShardTarget(db, cfg.Pool, f.Size, []int64{srcTape}, f.ObjectID, f.PartNumber)
+		} else {
+			tape, err = pickTapeExcluding(db, cfg.Pool, f.Size, srcTape)
+		}
 		if err != nil {
 			return err
 		}
@@ -420,7 +482,7 @@ func repackOneFile(db *sql.DB, cfg Config, ch Changer, srcTape int64, f *LiveTap
 		if werr != nil {
 			return werr
 		}
-		if err := moveTapeFile(db, f.TapeFileID, tape.ID, f.ObjectID, f.PartNumber, archiveID, physical, f.Size); err != nil {
+		if err := moveTapeFile(db, f.TapeFileID, tape.ID, f.ObjectID, f.PartNumber, f.ShardNumber, archiveID, physical, f.Size); err != nil {
 			return err
 		}
 		if err := addTapeWritten(db, tape.ID, f.Size); err != nil {
@@ -429,4 +491,325 @@ func repackOneFile(db *sql.DB, cfg Config, ch Changer, srcTape int64, f *LiveTap
 		return nil
 	}
 	return fmt.Errorf("ran out of target tapes")
+}
+
+
+// ---------- erasure coding (RAIT) ----------
+
+// ecDrives returns the drives available for parallel shard I/O.
+func ecDrives(cfg Config) []string {
+	if len(cfg.Drives) > 0 {
+		return cfg.Drives
+	}
+	return []string{cfg.Drive}
+}
+
+// ecArchive stripes one buffered object/part across k+m distinct
+// tapes (one shard each). On a multi-drive robot the shard tapes are
+// loaded into different DTEs and written in parallel — one stream per
+// drive, RAIT-style; a single drive (or manual changer) falls back to
+// sequential loads. EOM on a target marks that tape full and retries
+// the shard on a fresh one. Catalog rows land per shard as it
+// completes, so pickShardTarget's sibling exclusion stays honest.
+func ecArchive(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq, ec *ECConfig) error {
+	shards, err := ecEncodeFile(req.DiskPath, ec.K, ec.M, cfg.BufferDir,
+		fmt.Sprintf("ec-%d-%d", req.ObjectID, req.PartNumber))
+	if err != nil {
+		return failArchive(db, req.ID, "ec encode: "+err.Error())
+	}
+	defer func() {
+		for _, s := range shards {
+			_ = os.Remove(s.Path)
+		}
+	}()
+
+	drives := ecDrives(cfg)
+	multi, haveMulti := ch.(MultiDriveChanger)
+	parallel := haveMulti && len(drives) > 1
+	// Never strand tapes in drives on an error path.
+	usedDTEs := 0
+	defer func() {
+		for d := 0; d < usedDTEs; d++ {
+			_ = multi.UnloadDTE(d)
+		}
+	}()
+
+	// One target tape per shard, all distinct, sibling-aware.
+	targets := make([]*Tape, len(shards))
+	used := []int64{}
+	for i := range shards {
+		t, err := pickShardTarget(db, cfg.Pool, shards[i].Size, used, req.ObjectID, int64(req.PartNumber))
+		if err != nil {
+			return failArchive(db, req.ID, fmt.Sprintf("ec stripe: %v", err))
+		}
+		used = append(used, t.ID)
+		targets[i] = t
+	}
+
+	done := make([]bool, len(shards))
+	for round := 0; round < 16; round++ {
+		var batch []int
+		for i := range shards {
+			if !done[i] {
+				batch = append(batch, i)
+			}
+		}
+		if len(batch) == 0 {
+			break
+		}
+		if parallel && len(batch) > len(drives) {
+			batch = batch[:len(drives)]
+		}
+
+		// Load this batch: one shard tape per drive.
+		for j, i := range batch {
+			if parallel {
+				if err := multi.LoadInto(targets[i].Barcode, j); err != nil {
+					return failArchive(db, req.ID, "ec load "+targets[i].Barcode+": "+err.Error())
+				}
+				if j >= usedDTEs {
+					usedDTEs = j + 1
+				}
+			} else if err := ch.Load(targets[i].Barcode); err != nil {
+				return failArchive(db, req.ID, "ec load "+targets[i].Barcode+": "+err.Error())
+			}
+		}
+
+		// Write the shards, in parallel when each has its own drive.
+		type result struct {
+			physical int64
+			err      error
+		}
+		results := make([]result, len(batch))
+		if parallel {
+			var wg sync.WaitGroup
+			for j, i := range batch {
+				wg.Add(1)
+				go func(j, i int) {
+					defer wg.Done()
+					p, werr := writeTapeFile(drives[j], shards[i].Path)
+					results[j] = result{physical: p, err: werr}
+				}(j, i)
+			}
+			wg.Wait()
+		} else {
+			for j, i := range batch {
+				p, werr := writeTapeFile(cfg.Drive, shards[i].Path)
+				results[j] = result{physical: p, err: werr}
+			}
+		}
+
+		// Unload before cataloging/retrying.
+		if parallel {
+			for j := range batch {
+				_ = multi.UnloadDTE(j)
+			}
+		} else {
+			_ = ch.Unload()
+		}
+
+		for j, i := range batch {
+			switch results[j].err {
+			case nil:
+				archiveID, err := nextArchiveID(db, targets[i].ID)
+				if err != nil {
+					return err
+				}
+				if err := insertShardTapeFile(db, targets[i].ID, req.ObjectID,
+					int64(req.PartNumber), int64(i), archiveID, results[j].physical, shards[i].Size); err != nil {
+					return err
+				}
+				if err := insertShardVerifier(db, req.ObjectID, int64(req.PartNumber),
+					int64(i), shards[i].Size, shards[i].SHA256); err != nil {
+					return err
+				}
+				if err := addTapeWritten(db, targets[i].ID, shards[i].Size); err != nil {
+					return err
+				}
+				done[i] = true
+			case ErrTapeFull:
+				_ = markTapeFull(db, targets[i].ID)
+				fmt.Printf("worker: ec — %s hit EOM mid-shard; retrying elsewhere\n", targets[i].Barcode)
+				nt, err := pickShardTarget(db, cfg.Pool, shards[i].Size, used, req.ObjectID, int64(req.PartNumber))
+				if err != nil {
+					return failArchive(db, req.ID, fmt.Sprintf("ec stripe: %v", err))
+				}
+				used = append(used, nt.ID)
+				targets[i] = nt
+			default:
+				return failArchive(db, req.ID, fmt.Sprintf("ec write %s: %v", targets[i].Barcode, results[j].err))
+			}
+		}
+	}
+	for i := range done {
+		if !done[i] {
+			return failArchive(db, req.ID, "ec stripe: ran out of tapes for shards")
+		}
+	}
+
+	// Freeze the policy on the object, then the usual archive tail.
+	if err := setObjectEC(db, req.ObjectID, ec.K, ec.M); err != nil {
+		return err
+	}
+	if err := markArchiveWritten(db, req.ID); err != nil {
+		return err
+	}
+	if err := setPartDiskPath(db, req.ObjectID, req.PartNumber, ""); err != nil {
+		return err
+	}
+	if pend, err := objectPendingParts(db, req.ObjectID); err != nil {
+		return err
+	} else if pend == 0 {
+		if err := objectToGlacier(db, req.ObjectID); err != nil {
+			return err
+		}
+	}
+	_ = os.Remove(req.DiskPath)
+	tapes := make([]string, 0, len(shards))
+	for i, t := range targets {
+		if i == 0 || t.Barcode != targets[i-1].Barcode {
+			tapes = append(tapes, t.Barcode)
+		}
+	}
+	if mp, _ := isMultipart(db, req.ObjectID); mp {
+		fmt.Printf("worker: %s part %d → RAIT %d+%d across %s\n",
+			req.Key, req.PartNumber, ec.K, ec.M, strings.Join(tapes, "+"))
+	} else {
+		fmt.Printf("worker: %s → RAIT %d+%d across %s\n", req.Key, ec.K, ec.M, strings.Join(tapes, "+"))
+	}
+	return nil
+}
+
+// ecRestorePart rebuilds one part of an EC object: it reads k of the
+// surviving shard placements (parallel across drives when possible,
+// each shard sha-verified against the catalog), reconstructs missing
+// data shards from parity, and writes the exact original bytes to dst
+// (wantSHA is the part's — or single object's — verifier).
+func ecRestorePart(db *sql.DB, cfg Config, ch Changer, objectID, partNumber int64, ec *ECConfig, size int64, wantSHA, dst string) error {
+	placements, err := shardPlacements(db, objectID, partNumber)
+	if err != nil {
+		return err
+	}
+	if len(placements) < ec.K {
+		return fmt.Errorf("ec: only %d of %d shards placed (need %d)", len(placements), ec.K+ec.M, ec.K)
+	}
+
+	// Read plan: every surviving DATA shard, topped up with parity
+	// shards until k readable shards are in hand.
+	plan := make([]*ShardPlacement, 0, ec.K)
+	for i := range placements { // data shards first (shard order)
+		if placements[i].ShardNumber < int64(ec.K) {
+			plan = append(plan, &placements[i])
+		}
+	}
+	for i := range placements { // then parity as needed
+		if len(plan) >= ec.K {
+			break
+		}
+		if placements[i].ShardNumber >= int64(ec.K) {
+			plan = append(plan, &placements[i])
+		}
+	}
+	if len(plan) < ec.K {
+		return fmt.Errorf("ec: only %d readable shards (need %d)", len(plan), ec.K)
+	}
+
+	// Read the plan sequentially — load, read, verify, unload. (The
+	// WRITE side stripes in parallel across drives; reads are rarer
+	// and this keeps the degraded path simple and obviously correct.)
+	paths := make([]string, ec.K+ec.M)
+	for i := range paths {
+		paths[i] = ""
+	}
+	for _, p := range plan {
+		tmp := fmt.Sprintf("%s/ecshard-%d-%d-%d", cfg.BufferDir, objectID, partNumber, p.ShardNumber)
+		if err := ch.Load(p.Barcode); err != nil {
+			return err
+		}
+		sha, rerr := readTapeFile(cfg.Drive, p.PhysicalFile, tmp)
+		if rerr != nil {
+			_ = os.Remove(tmp)
+			_ = ch.Unload()
+			return fmt.Errorf("ec shard %d read from %s: %w", p.ShardNumber, p.Barcode, rerr)
+		}
+		if sha != p.SHA256 {
+			_ = os.Remove(tmp)
+			_ = ch.Unload()
+			return fmt.Errorf("ec shard %d checksum mismatch: %s gave %s, expected %s",
+				p.ShardNumber, p.Barcode, sha, p.SHA256)
+		}
+		paths[p.ShardNumber] = tmp
+	}
+	_ = ch.Unload()
+	defer func() {
+		for _, p := range paths {
+			if p != "" {
+				_ = os.Remove(p)
+			}
+		}
+	}()
+
+	// Decode: reconstruct missing data shards from parity, join to the
+	// exact size, verify against the part's catalog sha.
+	temps, derr := ecDecodeFile(paths, ec.K, ec.M, size, dst)
+	defer func() {
+		for _, t := range temps {
+			_ = os.Remove(t)
+		}
+	}()
+	if derr != nil {
+		return derr
+	}
+	if wantSHA != "" {
+		sha, err := sha256File(dst)
+		if err != nil {
+			return err
+		}
+		if sha != wantSHA {
+			return fmt.Errorf("ec decoded bytes differ: got %s, expected %s", sha, wantSHA)
+		}
+	}
+	return nil
+}
+
+// restoreMultipartEC rebuilds every part of an EC multipart object;
+// each part is decoded from its own k+m shard stripe.
+func restoreMultipartEC(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq, ec *ECConfig) error {
+	parts, err := listParts(db, req.ObjectID)
+	if err != nil {
+		return err
+	}
+	if len(parts) == 0 {
+		_ = failRetrieve(db, req.ID, "multipart object has no parts (upload incomplete?)")
+		return nil
+	}
+	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
+		return err
+	}
+	for _, p := range parts {
+		// A part may already be on disk (still buffered or pinned).
+		if p.DiskPath != "" {
+			if _, err := os.Stat(p.DiskPath); err == nil {
+				continue
+			}
+		}
+		dst := filepath.Join(cfg.BufferDir, fmt.Sprintf("part-%d-%05d", req.ObjectID, p.Number))
+		if err := ecRestorePart(db, cfg, ch, req.ObjectID, int64(p.Number), ec, p.Size, p.SHA256, dst); err != nil {
+			_ = os.Remove(dst)
+			_ = failRetrieve(db, req.ID, fmt.Sprintf("part %d: %v", p.Number, err))
+			return nil
+		}
+		if err := setPartDiskPath(db, req.ObjectID, p.Number, dst); err != nil {
+			return err
+		}
+	}
+	if err := objectToStandardMultipart(db, req.ObjectID); err != nil {
+		return err
+	}
+	if err := restoreComplete(db, req.ID, time.Now().AddDate(0, 0, req.PinDays)); err != nil {
+		return err
+	}
+	fmt.Printf("worker: restored %s (%d RAIT %d+%d parts, pinned %d days)\n",
+		req.Key, len(parts), ec.K, ec.M, req.PinDays)
+	return nil
 }

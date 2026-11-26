@@ -23,8 +23,11 @@ cd "$ROOT"
 go build -o "$BIN" . || fail "build failed"
 
 CHANGER_DEV=$(lsscsi -g | awk '$2=="mediumx"{print $NF}')
-ST=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1)}')
+ST=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1); exit}')
 DRIVE=${ST/\/st/\/nst}
+# All three VTL drives, DTE order — RAIT shards stripe across them in
+# parallel (lsscsi lists them in SCSI target order: DTE 0, 1, 2).
+DRIVES=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1)}' | sed 's:/st:/nst:' | sort | paste -sd,)
 
 set -a; . "$ROOT/.env"; set +a
 # Hermetic: never read the host's /etc/tapeberg.conf (robot mode, no
@@ -32,6 +35,7 @@ set -a; . "$ROOT/.env"; set +a
 export TAPEBERG_CONF=/dev/null
 unset TAPEBERG_TELEGRAM_TOKEN TAPEBERG_TELEGRAM_CHAT TAPEBERG_WEBHOOK_URL TAPEBERG_WEBHOOK_TOKEN
 export TAPEBERG_DRIVE="$DRIVE" TAPEBERG_CHANGER=robot TAPEBERG_CHANGER_DEV="$CHANGER_DEV" TAPEBERG_POOL=vtl
+export TAPEBERG_DRIVES="$DRIVES"
 export TAPEBERG_BUFFER="$WORK/buffer"
 export TAPEBERG_S3_KEY="tapeberg-test" TAPEBERG_S3_SECRET="tapeberg-test-secret"
 mkdir -p "$TAPEBERG_BUFFER"
@@ -59,6 +63,7 @@ DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objects WHERE k
 DELETE FROM archive_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 's3e2e%');
 DELETE FROM tape_files WHERE tape_id IN (SELECT id FROM tapes WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl'));
 UPDATE tapes SET state='active', written_bytes=0 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl');
+UPDATE tape_pools SET ec_k=NULL, ec_m=NULL;
 DELETE FROM objects WHERE key LIKE 's3e2e%';" >/dev/null
 
 say "starting the S3 endpoint"
@@ -314,6 +319,35 @@ $AWS s3api restore-object --bucket vtl --key s3e2e-del-b --restore-request Days=
 "$BIN" worker >/dev/null || fail "worker failed restoring repacked object"
 $AWS s3api get-object --bucket vtl --key s3e2e-del-b "$WORK/del-b-out" >/dev/null || fail "get of repacked object failed"
 cmp "$WORK/del-b" "$WORK/del-b-out" || fail "repacked bytes differ from upload"
+
+say "erasure coding: RAIT 2+1 stripe across three tapes, three drives"
+"$BIN" pool set vtl --ec-k 2 --ec-m 1 || fail "pool set --ec-k/--ec-m failed"
+dd if=/dev/urandom of="$WORK/ec-src" bs=1M count=12 status=none
+$AWS s3api put-object --bucket vtl --key s3e2e-ec --body "$WORK/ec-src" >/dev/null || fail "put ec object failed"
+"$BIN" worker > "$WORK/ec.log" 2>&1 || fail "worker failed striping the EC object"
+grep -q "RAIT 2+1" "$WORK/ec.log" || fail "worker did not RAIT-stripe: $(tail -2 "$WORK/ec.log")"
+[ "$($PSQL -c "SELECT ec_k FROM objects WHERE key='s3e2e-ec'")" = 2 ] || fail "object did not freeze the EC policy"
+NTAPES=$($PSQL -c "SELECT count(DISTINCT tf.tape_id) FROM tape_files tf JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-ec'")
+[ "$NTAPES" = 3 ] || fail "shards must sit on 3 distinct tapes, got $NTAPES"
+[ "$($PSQL -c "SELECT count(*) FROM object_shards os JOIN objects o ON o.id=os.object_id WHERE o.key='s3e2e-ec'")" = 3 ] || fail "expected 3 shard verifiers"
+$AWS s3api restore-object --bucket vtl --key s3e2e-ec --restore-request Days=1 || fail "restore of EC object failed"
+"$BIN" worker >/dev/null || fail "worker failed restoring the EC object"
+$AWS s3api get-object --bucket vtl --key s3e2e-ec "$WORK/ec-out" >/dev/null || fail "get of EC object failed"
+cmp "$WORK/ec-src" "$WORK/ec-out" || fail "EC round-trip bytes differ"
+
+say "RAIT degrades: one tape lost, parity rebuilds the bytes"
+LOST=$($PSQL -c "SELECT t.barcode FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-ec' AND tf.shard_number=0")
+[ -n "$LOST" ] || fail "no shard-0 placement found"
+# The tape is GONE: state lost, placement rows gone.
+$PSQL -c "UPDATE tapes SET state='lost' WHERE barcode='$LOST'; DELETE FROM tape_files WHERE tape_id=(SELECT id FROM tapes WHERE barcode='$LOST');"
+# Object back to tape-only, then restore from the surviving shards.
+rm -f "$TAPEBERG_BUFFER/s3e2e-ec"
+$PSQL -c "UPDATE objects SET storage_class='GLACIER', disk_path=NULL WHERE key='s3e2e-ec'; UPDATE retrieve_requests SET state='expired' WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-ec');" >/dev/null
+$AWS s3api restore-object --bucket vtl --key s3e2e-ec --restore-request Days=1 || fail "restore request after tape loss failed"
+"$BIN" worker > "$WORK/ec2.log" 2>&1 || fail "worker failed degraded restore"
+grep -q "RAIT" "$WORK/ec2.log" || fail "degraded restore did not run the EC path: $(tail -2 "$WORK/ec2.log")"
+$AWS s3api get-object --bucket vtl --key s3e2e-ec "$WORK/ec-out2" >/dev/null || fail "get after tape loss failed"
+cmp "$WORK/ec-src" "$WORK/ec-out2" || fail "degraded EC bytes differ — parity reconstruction broken"
 
 kill $SRV_PID 2>/dev/null || true
 SRV_PID=""

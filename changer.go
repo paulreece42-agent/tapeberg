@@ -26,6 +26,14 @@ type Changer interface {
 	Unload() error
 }
 
+// MultiDriveChanger is what a robot with several drives offers: tapes
+// can sit in different DTEs at once, so RAIT shards stream in parallel.
+type MultiDriveChanger interface {
+	Changer
+	LoadInto(barcode string, dte int) error
+	UnloadDTE(dte int) error
+}
+
 // ---------- robot ----------
 
 type RobotChanger struct {
@@ -124,6 +132,70 @@ func (r *RobotChanger) loadedBarcode() (string, error) {
 func (r *RobotChanger) Unload() error {
 	if out, err := exec.Command("mtx", "-f", r.Dev, "unload").CombinedOutput(); err != nil {
 		return fmt.Errorf("mtx unload: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// loadedBarcodeIn reports the volume tag in data transfer element dte.
+func (r *RobotChanger) loadedBarcodeIn(dte int) (string, error) {
+	out, err := exec.Command("mtx", "-f", r.Dev, "status").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("mtx status: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	want := fmt.Sprintf("Data Transfer Element %d:", dte)
+	for _, line := range strings.Split(string(out), "\n") {
+		if !strings.HasPrefix(strings.TrimSpace(line), want) {
+			continue
+		}
+		if i := strings.Index(line, "VolumeTag"); i >= 0 {
+			tag := strings.TrimSpace(strings.TrimLeft(line[i+len("VolumeTag"):], "= 	"))
+			if tag == "" {
+				return "", nil
+			}
+			return strings.Fields(tag)[0], nil
+		}
+		return "", nil
+	}
+	return "", nil
+}
+
+// LoadInto loads barcode into a specific data transfer element, so
+// several shard tapes can sit in the library at once (RAIT stripes).
+func (r *RobotChanger) LoadInto(barcode string, dte int) error {
+	if cur, err := r.loadedBarcodeIn(dte); err == nil && cur == barcode {
+		return nil // already there
+	}
+	slot, err := r.slotFor(barcode)
+	if err != nil {
+		return err
+	}
+	if out, err := exec.Command("mtx", "-f", r.Dev, "load", strconv.Itoa(slot), strconv.Itoa(dte)).CombinedOutput(); err != nil {
+		return fmt.Errorf("mtx load %d dte %d: %w: %s", slot, dte, err, strings.TrimSpace(string(out)))
+	}
+	time.Sleep(time.Second) // mount settle (rig-verified race)
+	return nil
+}
+
+func (r *RobotChanger) UnloadDTE(dte int) error {
+	// mtx's unload is "unload [<slotnum>] [<drivenum>]" — the slot
+	// defaults to drive 0's origin, so a specific drive needs its
+	// tape's home slot spelled out (it is parsed from the element
+	// line: "Data Transfer Element 1:Full (Storage Element 5 Loaded)").
+	if cur, err := r.loadedBarcodeIn(dte); err == nil && cur == "" {
+		return nil // nothing loaded
+	}
+	out, err := exec.Command("mtx", "-f", r.Dev, "status").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mtx status: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	originRe := regexp.MustCompile(
+		fmt.Sprintf(`Data Transfer Element %d:Full \(Storage Element (\d+) Loaded\)`, dte))
+	m := originRe.FindStringSubmatch(string(out))
+	if m == nil {
+		return fmt.Errorf("cannot find origin slot for DTE %d — unload it by hand", dte)
+	}
+	if out, err := exec.Command("mtx", "-f", r.Dev, "unload", m[1], strconv.Itoa(dte)).CombinedOutput(); err != nil {
+		return fmt.Errorf("mtx unload %s %d: %w: %s", m[1], dte, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
