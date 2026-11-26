@@ -27,7 +27,7 @@ go build -o "$BIN" . || fail "build failed"
 
 say "discovering VTL devices"
 CHANGER_DEV=$(lsscsi -g | awk '$2=="mediumx"{print $NF}')
-ST=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1)}')
+ST=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1); exit}')
 DRIVE=${ST/\/st/\/nst}
 [ -n "$CHANGER_DEV" ] || fail "no mediumx device — is mhvtl up?"
 [ -n "$DRIVE" ] || fail "no VTL tape drive found"
@@ -64,6 +64,7 @@ $PSQL -c "DELETE FROM retrieve_requests WHERE object_id IN (SELECT id FROM objec
 DELETE FROM archive_requests WHERE object_id IN (SELECT id FROM objects WHERE key LIKE 'e2e-%');
 DELETE FROM tape_files WHERE tape_id IN (SELECT id FROM tapes WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl'));
 UPDATE tapes SET state='active', written_bytes=0 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl');
+UPDATE tape_pools SET ec_k=NULL, ec_m=NULL;
 DELETE FROM objects WHERE key LIKE 'e2e-%';" >/dev/null
 
 say "generating 5 x 20MiB incompressible files (forces EOM + tape swap)"

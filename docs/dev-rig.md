@@ -8,12 +8,20 @@ so `mtx`, `mt`, `sg_*` and Tapeberg's own code exercise the genuine path.
 
 - Real drive: **TANDBERG LTO-5 HH** (fw Z629) — `/dev/st0`, `/dev/nst0`,
   generic node `/dev/sg1`, group `tape`.
-- VTL: one emulated library ("SPECTRA PYTHON", serial TAPEBERG1) with a
-  single emulated **IBM ULT3580-TD5** (LTO-5) drive, serial TB-DRIVE01,
-  plus 16 data tapes (barcodes `TB0001L5`..`TB0016L5`) and 1 cleaning tape.
+- VTL: one emulated library ("SPECTRA PYTHON", serial TAPEBERG1) with
+  **three emulated IBM ULT3580-TD5 (LTO-5) drives** — serials
+  TB-DRIVE01/02/03, `/dev/nst1..nst3`, DTEs 0-2 — so RAIT shards
+  stripe in parallel, plus 16 data tapes (barcodes `TB0001L5`..
+  `TB0016L5`) and 1 cleaning tape.
 - mhvtl 1.8.0 (git 2c40a93) built from source, kernel module `mhvtl.ko`
   installed for the running kernel and loaded at boot via systemd units
-  (`mhvtl.target`, `vtllibrary@10`, `vtltape@11`).
+  (`mhvtl.target`, `vtllibrary@10`, `vtltape@11`/`12`/`13`).
+  Drive count gotcha: the changer's DTE count comes from the
+  `Drive N:` sections in **library_contents** (not just device.conf) —
+  add `Drive 2:`/`Drive 3:` there or mtx reports one DTE. And
+  `mtx unload` is `unload [<slot>] [<drive>]` — the slot arg defaults
+  to drive 0's origin, so per-drive unloads must spell out the origin
+  slot (parsed from the element status line).
 - User `major` is in the `tape` group for unprivileged drive access
   (new sessions only; the changer node is group `cdrom`).
 

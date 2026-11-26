@@ -68,6 +68,30 @@ users are refused. While no user exists the endpoint keeps the legacy
 behavior (static `TAPEBERG_S3_KEY/SECRET`, or unsigned dev mode) —
 the first created user switches it to real DB auth.
 
+## Erasure coding (RAIT — Reed-Solomon across tapes)
+
+Pools carry an EC policy: `k` data shards + `m` parity shards per
+archive, each shard on a **different tape**. Any `m` tapes can be lost
+and everything still restores — RAID for tape.
+
+```sh
+tapeberg pool set vtl --ec-k 2 --ec-m 1   # RAIT 2+1
+tapeberg pool ls
+tapeberg pool set vtl --no-ec             # back to single copy
+```
+
+The unit of coding is the object (or multipart **part** — sizes are
+exact, the piece size-agnostic EC designs struggle with). The policy
+freezes onto each object at archive time, so changing a pool never
+invalidates what is already on tape. On a multi-drive robot
+(`TAPEBERG_DRIVES=/dev/nst1,/dev/nst2,/dev/nst3`, DTE order) the
+shard tapes are loaded into separate drives and written in parallel,
+one stream per drive; a single-drive rig writes the shards
+sequentially. Every shard is sha-verified against the catalog on
+read, and a restore with missing shards reconstructs them from
+parity. Repack is RAIT-aware: a repacked shard never lands on a
+sibling shard's tape.
+
 ## Deletes & repack (the year-3 problem)
 
 DeleteObject (and `tapeberg rm`) is a **soft delete**: the object gets
