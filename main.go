@@ -11,6 +11,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -184,7 +185,8 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool 
 		return nil, err
 	}
 	h := sha256.New()
-	size, err := io.Copy(io.MultiWriter(out, h), r)
+	mh := md5.New()
+	size, err := io.Copy(io.MultiWriter(out, h, mh), r)
 	if err != nil {
 		out.Close()
 		os.Remove(dst)
@@ -194,7 +196,8 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool 
 		os.Remove(dst)
 		return nil, err
 	}
-	obj, err := insertObject(db, bucket, key, size, hex.EncodeToString(h.Sum(nil)), dst, owner)
+	obj, err := insertObject(db, bucket, key, size, hex.EncodeToString(h.Sum(nil)),
+		hex.EncodeToString(mh.Sum(nil)), dst, owner)
 	if err != nil {
 		os.Remove(dst)
 		return nil, err

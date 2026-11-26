@@ -90,8 +90,8 @@ dd if=/dev/urandom of="$WORK/obj" bs=1M count=5 status=none
 ETAG=$($AWS s3api put-object --bucket vtl --key s3e2e-obj --body "$WORK/obj" --query ETag --output text)
 [ -n "$ETAG" ] || fail "put-object returned no ETag"
 echo "put ETag: $ETAG"
-sha=$(sha256sum "$WORK/obj" | cut -d' ' -f1)
-[ "$ETAG" = "\"$sha\"" ] || fail "ETag does not match client-side sha256"
+sha=$(md5sum "$WORK/obj" | cut -d' ' -f1)
+[ "$ETAG" = "\"$sha\"" ] || fail "ETag does not match client-side md5 (S3 contract: single-put ETag is the content md5)"
 
 say "head-object while disk-buffered (STANDARD)"
 $AWS s3api head-object --bucket vtl --key s3e2e-obj > "$WORK/head1.json"
@@ -292,6 +292,17 @@ if AWS_SECRET_ACCESS_KEY="wrong-secret" $AWS s3api list-buckets >/dev/null 2>&1;
   fail "bad credentials were accepted"
 fi
 echo "bad signature rejected"
+
+say "S3 ETag: md5 on single put, 409 on live duplicate, delete unbricks the key"
+ET=$($AWS s3api put-object --bucket vtl --key s3e2e-etag --body "$WORK/obj" --query ETag --output text | tr -d '"')
+[ "$ET" = "$(md5sum "$WORK/obj" | awk '{print $1}')" ] || fail "single-put ETag must be the content md5 (got $ET, want $(md5sum "$WORK/obj" | awk '{print $1}'))"
+H=$($AWS s3api head-object --bucket vtl --key s3e2e-etag --query ETag --output text | tr -d '"')
+[ "$H" = "$ET" ] || fail "HEAD must present the same ETag (got $H)"
+$AWS s3api put-object --bucket vtl --key s3e2e-etag --body "$WORK/obj" >/dev/null 2>&1 && fail "duplicate put must 409 (no overwrite)"
+$AWS s3api delete-object --bucket vtl --key s3e2e-etag || fail "delete failed"
+ET2=$($AWS s3api put-object --bucket vtl --key s3e2e-etag --body "$WORK/obj" --query ETag --output text | tr -d '"') || fail "delete-then-reput must work (was bricked by the v0 unique constraint)"
+[ "$ET2" = "$ET" ] || fail "re-put ETag must match"
+$AWS s3api delete-object --bucket vtl --key s3e2e-etag || fail "cleanup delete failed"
 
 say "auth: builtin DB users, tenancy, key rotation (RGW-style)"
 [ "$($PSQL -c "SELECT count(*) FROM s3_users")" = 0 ] || fail "expected no users at this point"

@@ -473,7 +473,7 @@ func (s *s3srv) serveBucket(w http.ResponseWriter, r *http.Request, bucket strin
 			}
 			out.Contents = append(out.Contents, objectXML{
 				Key: o.Key, LastModified: o.CreatedAt.Format(time.RFC3339),
-				ETag: `"` + o.SHA256 + `"`, Size: o.Size, StorageClass: sc,
+				ETag: `"` + o.etagOf() + `"`, Size: o.Size, StorageClass: sc,
 			})
 		}
 		w.Header().Set("Content-Type", "application/xml")
@@ -527,14 +527,14 @@ func (s *s3srv) putObject(w http.ResponseWriter, r *http.Request, bucket, key st
 		}
 		return err
 	}
-	w.Header().Set("ETag", `"`+obj.SHA256+`"`)
+	w.Header().Set("ETag", `"`+obj.etagOf()+`"`)
 	w.WriteHeader(http.StatusOK)
 	return nil
 }
 
 // setObjectHeaders writes the common object metadata headers.
 func setObjectHeaders(w http.ResponseWriter, obj *Object, st string, exp time.Time, found bool) {
-	w.Header().Set("ETag", `"`+obj.SHA256+`"`)
+	w.Header().Set("ETag", `"`+obj.etagOf()+`"`)
 	w.Header().Set("Last-Modified", obj.CreatedAt.UTC().Format(http.TimeFormat))
 	w.Header().Set("Accept-Ranges", "bytes")
 	if obj.StorageClass == "GLACIER" || obj.StorageClass == "DEEP_ARCHIVE" {
