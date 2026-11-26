@@ -206,13 +206,62 @@ $AWS s3api restore-object --bucket vtl --key s3e2e-tar-pipe --restore-request Da
 say "tar-pipe read-back: s3cmd streaming get | tar -t"
 s3cmd --config "$WORK/s3cfg" get s3://vtl/s3e2e-tar-pipe - 2>/dev/null | tar -tf - | grep -q hello.txt || fail "tar-pipe round-trip failed"
 
-say "abort multipart upload"
+say "abort multipart upload: eager archives → tombstone, not data loss"
 UPID=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-mp-abort --query UploadId --output text)
 $AWS s3api upload-part --bucket vtl --key s3e2e-mp-abort --upload-id "$UPID" --part-number 1 --body "$WORK/obj" >/dev/null || fail "upload-part failed"
+# Run the worker: the part is EAGERLY archived (buffer disk reclaimed).
+"$BIN" worker >/dev/null || fail "worker failed archiving the aborted upload's part"
+[ -n "$($PSQL -c "SELECT 1 FROM tape_files tf JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-mp-abort'")" ] || fail "part should be on tape already (eager archive)"
+PARTPATH=$($PSQL -c "SELECT disk_path FROM object_parts WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-abort')")
+[ "$PARTPATH" = "" ] || fail "archived part should have no disk copy (worker already reclaimed it)"
 $AWS s3api abort-multipart-upload --bucket vtl --key s3e2e-mp-abort --upload-id "$UPID" || fail "abort failed"
 if $AWS s3api head-object --bucket vtl --key s3e2e-mp-abort >/dev/null 2>&1; then
   fail "aborted upload should not be visible"
 fi
+# The abort left a tombstone: tape bytes stay (dead, repack reclaims),
+# queued archives cancelled, nothing orphaned.
+[ "$($PSQL -c "SELECT count(*) FROM objects WHERE key='s3e2e-mp-abort' AND deleted_at IS NOT NULL")" = 1 ] || fail "abort must tombstone the object"
+[ "$($PSQL -c "SELECT count(*) FROM archive_requests a JOIN objects o ON o.id=a.object_id WHERE o.key='s3e2e-mp-abort' AND a.state IN ('pending','assigned')")" = 0 ] || fail "abort must cancel queued archives"
+[ "$($PSQL -c "SELECT count(*) FROM tape_files tf JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-mp-abort'")" -ge 1 ] || fail "tombstone must keep the dead tape placements for repack accounting"
+ABOID=$($PSQL -c "SELECT id FROM objects WHERE key='s3e2e-mp-abort'")
+ls "$TAPEBERG_BUFFER"/part-"$ABOID"-* 2>/dev/null | grep -q . && fail "abort left buffered part files on disk"
+
+# Undo the aborted part's tape footprint surgically (only ITS rows and
+# bytes — the tape may hold live data) so later placement sections see
+# the fill order they were designed around. Stale physical bytes stay
+# on the tape; a mid-write EOM is a handled retry, not a failure.
+$PSQL -c "UPDATE tapes SET written_bytes = written_bytes -
+        (SELECT COALESCE(sum(size_bytes),0) FROM tape_files
+          WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-abort'))
+        WHERE id IN (SELECT DISTINCT tape_id FROM tape_files
+          WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-abort'));
+        DELETE FROM tape_files WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-abort');
+        DELETE FROM object_shards WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-mp-abort');" >/dev/null
+
+say "multipart part size policy (min on complete, max on upload)"
+# A second endpoint with tape-sized limits, so stock-client sections
+# above keep the protocol 5MiB floor.
+S3L2="127.0.0.1:7392"
+TAPEBERG_S3_LISTEN="$S3L2" TAPEBERG_PART_MIN_BYTES=$((32*1024*1024)) TAPEBERG_PART_MAX_BYTES=$((48*1024*1024)) \
+  "$BIN" s3 >/dev/null 2>&1 &
+SRV2_PID=$!
+sleep 1
+AWS2="$AWS --endpoint-url http://$S3L2"
+UP2=$($AWS2 s3api create-multipart-upload --bucket vtl --key s3e2e-partsize --query UploadId --output text)
+head -c 16MiB /dev/urandom > "$WORK/ps-p1"; head -c 16MiB /dev/urandom > "$WORK/ps-p2"
+$AWS2 s3api upload-part --bucket vtl --key s3e2e-partsize --upload-id "$UP2" --part-number 1 --body "$WORK/ps-p1" >/dev/null || fail "small part upload itself must be accepted (S3 defers to complete)"
+$AWS2 s3api upload-part --bucket vtl --key s3e2e-partsize --upload-id "$UP2" --part-number 2 --body "$WORK/ps-p2" >/dev/null || fail "small final part upload must be accepted"
+E1=$($AWS2 s3api complete-multipart-upload --bucket vtl --key s3e2e-partsize --upload-id "$UP2" --multipart-upload "Parts=[{ETag=$($AWS2 s3api list-parts --bucket vtl --key s3e2e-partsize --upload-id "$UP2" --query 'Parts[0].ETag' --output text),PartNumber=1},{ETag=$($AWS2 s3api list-parts --bucket vtl --key s3e2e-partsize --upload-id "$UP2" --query 'Parts[1].ETag' --output text),PartNumber=2}]" 2>&1) && fail "complete must reject undersized non-final part"
+echo "$E1" | grep -q EntityTooSmall || fail "expected EntityTooSmall, got: $E1"
+head -c 49MiB /dev/urandom > "$WORK/ps-big"
+E2=$($AWS2 s3api upload-part --bucket vtl --key s3e2e-partsize --upload-id "$UP2" --part-number 3 --body "$WORK/ps-big" 2>&1) && fail "oversized part must be rejected at upload"
+echo "$E2" | grep -q EntityTooLarge || fail "expected EntityTooLarge, got: $E2"
+# The accepted (but never completable) parts are queued for eager
+# archive — abort the upload to cancel them, or they'd land on tape and
+# skew every later placement assertion.
+$AWS2 s3api abort-multipart-upload --bucket vtl --key s3e2e-partsize --upload-id "$UP2" || fail "abort of the partsize upload failed"
+[ "$($PSQL -c "SELECT count(*) FROM archive_requests a JOIN objects o ON o.id=a.object_id WHERE o.key='s3e2e-partsize' AND a.state IN ('pending','assigned')")" = 0 ] || fail "partsize abort must cancel its queued part archives"
+kill $SRV2_PID 2>/dev/null || true
 
 say "SigV4 is enforced (bad signature rejected)"
 if AWS_SECRET_ACCESS_KEY="wrong-secret" $AWS s3api list-buckets >/dev/null 2>&1; then
