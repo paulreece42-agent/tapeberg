@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -59,6 +60,20 @@ func newChanger(cfg Config) (Changer, error) {
 }
 
 func RunWorker(cfg Config) error {
+	// Single instance per buffer/rig: concurrent workers interleave mt
+	// ops on one drive and race archive claims. Lock inside the binary
+	// so cron AND manual runs serialize (the cron line no longer needs
+	// its own flock — it would deadlock against this one).
+	if err := os.MkdirAll(cfg.BufferDir, 0o755); err == nil {
+		if lf, err := os.OpenFile(filepath.Join(cfg.BufferDir, ".worker.lock"),
+			os.O_CREATE|os.O_RDWR, 0o644); err == nil {
+			defer lf.Close()
+			if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				fmt.Println("worker: another instance holds the lock; skipping this pass")
+				return nil
+			}
+		}
+	}
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
@@ -80,7 +95,7 @@ func RunWorker(cfg Config) error {
 	if err := uploadSweep(db, cfg); err != nil {
 		return err
 	}
-	return expirySweep(db)
+	return expirySweep(db, cfg.Pool)
 }
 
 // uploadSweep tombstones multipart uploads that were started but
@@ -92,7 +107,7 @@ func uploadSweep(db *sql.DB, cfg Config) error {
 	if cfg.UploadTTLDays <= 0 {
 		return nil
 	}
-	ids, err := abandonedUploads(db, cfg.UploadTTLDays)
+	ids, err := abandonedUploads(db, cfg.UploadTTLDays, cfg.Pool)
 	if err != nil || len(ids) == 0 {
 		return err
 	}
@@ -337,6 +352,12 @@ func restoreMultipart(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) erro
 	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
 		return err
 	}
+	// Sequential placement: parts usually sit back-to-back on one tape.
+	// readTapeFileAt tracks the drive's file position, so the whole run
+	// does ONE rewind+seek and then streams part after part — a
+	// rewind+fsf per part would re-shoe the drive for minutes.
+	cur := int64(0)
+	lastBar := ""
 	for i := range parts {
 		p := &parts[i]
 		// A part may already be on disk (still buffered or pinned).
@@ -345,18 +366,23 @@ func restoreMultipart(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) erro
 				continue
 			}
 		}
-		if err := ch.Load(p.Barcode); err != nil {
-			_ = failRetrieve(db, req.ID, err.Error())
-			return nil
+		if p.Barcode != lastBar {
+			if err := ch.Load(p.Barcode); err != nil {
+				_ = failRetrieve(db, req.ID, err.Error())
+				return nil
+			}
+			lastBar = p.Barcode
+			cur = 0
 		}
 		dst := filepath.Join(cfg.BufferDir, fmt.Sprintf("part-%d-%05d", req.ObjectID, p.Number))
-		sha, rerr := readTapeFile(cfg.Drive, p.PhysicalFile, dst)
+		sha, newCur, rerr := readTapeFileAt(cfg.Drive, p.PhysicalFile, cur, dst)
 		if rerr != nil {
 			_ = os.Remove(dst)
 			_ = failRetrieve(db, req.ID, fmt.Sprintf("part %d: %v", p.Number, rerr))
 			_ = ch.Unload()
 			return nil
 		}
+		cur = newCur
 		if sha != p.SHA256 {
 			_ = os.Remove(dst)
 			_ = failRetrieve(db, req.ID, fmt.Sprintf("part %d checksum mismatch: tape %s gave %s, expected %s", p.Number, p.Barcode, sha, p.SHA256))
@@ -385,8 +411,8 @@ func restoreMultipart(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) erro
 }
 
 // expirySweep unpins restores whose Glacier-style pin has lapsed.
-func expirySweep(db *sql.DB) error {
-	rows, err := expiredRestores(db)
+func expirySweep(db *sql.DB, pool string) error {
+	rows, err := expiredRestores(db, pool)
 	if err != nil {
 		return err
 	}
