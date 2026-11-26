@@ -31,10 +31,20 @@ type Object struct {
 	Key          string
 	Size         int64
 	SHA256       string
+	Etag         string // S3 ETag: md5 (single put) or md5-of-md5s-N (multipart); "" = present sha256
 	StorageClass string
 	DiskPath     string // "" when tape-only
 	OwnerID      int64  // 0 = system (CLI ingests, legacy rows)
 	CreatedAt    time.Time
+}
+
+// etagOf is what object-serving code presents as the S3 ETag: the
+// proper md5 etag when known, else the stored sha256 (legacy rows).
+func (o *Object) etagOf() string {
+	if o.Etag != "" {
+		return o.Etag
+	}
+	return o.SHA256
 }
 
 func bucketID(db *sql.DB) (int64, error) { return bucketIDByName(db, "tapeberg") }
@@ -114,7 +124,7 @@ func listBucketsFor(db *sql.DB, u AuthUser) ([]BucketRow, error) {
 // listObjectsFor scopes object listing the same way.
 func listObjectsFor(db *sql.DB, bucket, prefix string, u AuthUser) ([]Object, error) {
 	q := `
-		SELECT o.id, o.key, o.size_bytes, COALESCE(o.sha256,''), o.storage_class,
+		SELECT o.id, o.key, o.size_bytes, COALESCE(o.sha256,''), COALESCE(o.etag,''), o.storage_class,
 		       COALESCE(o.disk_path,''), o.created_at
 		FROM objects o JOIN buckets b ON b.id = o.bucket_id
 		WHERE b.name = $1 AND ($2 = '' OR o.key LIKE $2 || '%')
@@ -133,7 +143,7 @@ func listObjectsFor(db *sql.DB, bucket, prefix string, u AuthUser) ([]Object, er
 	var out []Object
 	for rows.Next() {
 		var o Object
-		if err := rows.Scan(&o.ID, &o.Key, &o.Size, &o.SHA256, &o.StorageClass, &o.DiskPath, &o.CreatedAt); err != nil {
+		if err := rows.Scan(&o.ID, &o.Key, &o.Size, &o.SHA256, &o.Etag, &o.StorageClass, &o.DiskPath, &o.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -143,7 +153,7 @@ func listObjectsFor(db *sql.DB, bucket, prefix string, u AuthUser) ([]Object, er
 
 func listObjects(db *sql.DB, bucket, prefix string) ([]Object, error) {
 	rows, err := db.Query(`
-		SELECT o.id, o.key, o.size_bytes, COALESCE(o.sha256,''), o.storage_class, COALESCE(o.disk_path,''), o.created_at
+		SELECT o.id, o.key, o.size_bytes, COALESCE(o.sha256,''), COALESCE(o.etag,''), o.storage_class, COALESCE(o.disk_path,''), o.created_at
 		FROM objects o JOIN buckets b ON b.id = o.bucket_id
 		WHERE b.name = $1 AND ($2 = '' OR o.key LIKE $2 || '%') AND o.upload_id IS NULL
 		  AND o.deleted_at IS NULL
@@ -155,7 +165,7 @@ func listObjects(db *sql.DB, bucket, prefix string) ([]Object, error) {
 	var out []Object
 	for rows.Next() {
 		var o Object
-		if err := rows.Scan(&o.ID, &o.Key, &o.Size, &o.SHA256, &o.StorageClass, &o.DiskPath, &o.CreatedAt); err != nil {
+		if err := rows.Scan(&o.ID, &o.Key, &o.Size, &o.SHA256, &o.Etag, &o.StorageClass, &o.DiskPath, &o.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -172,10 +182,10 @@ func getObjectIn(db *sql.DB, bucket, key string) (*Object, error) {
 	var sha, path sql.NullString
 	var owner sql.NullInt64
 	err = db.QueryRow(`
-		SELECT id, size_bytes, sha256, storage_class, disk_path, created_at, owner_id
+		SELECT id, size_bytes, sha256, COALESCE(etag,''), storage_class, disk_path, created_at, owner_id
 		FROM objects WHERE bucket_id = $1 AND key = $2 AND upload_id IS NULL
 		  AND deleted_at IS NULL`, bid, key).
-		Scan(&o.ID, &o.Size, &sha, &o.StorageClass, &path, &o.CreatedAt, &owner)
+		Scan(&o.ID, &o.Size, &sha, &o.Etag, &o.StorageClass, &path, &o.CreatedAt, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("object %q: %w", key, ErrNotFound)
 	}
@@ -207,16 +217,16 @@ func activeRetrieve(db *sql.DB, objectID int64) (state string, expires time.Time
 }
 
 // insertObject records an already-staged disk copy as a STANDARD object.
-func insertObject(db *sql.DB, bucket, key string, size int64, sha256hex, diskPath string, owner int64) (*Object, error) {
+func insertObject(db *sql.DB, bucket, key string, size int64, sha256hex, etag, diskPath string, owner int64) (*Object, error) {
 	bid, err := bucketIDByName(db, bucket)
 	if err != nil {
 		return nil, err
 	}
-	o := &Object{Key: key, Size: size, SHA256: sha256hex, StorageClass: "STANDARD", DiskPath: diskPath, OwnerID: owner}
+	o := &Object{Key: key, Size: size, SHA256: sha256hex, Etag: etag, StorageClass: "STANDARD", DiskPath: diskPath, OwnerID: owner}
 	err = db.QueryRow(`
-		INSERT INTO objects (bucket_id, key, size_bytes, sha256, storage_class, disk_path, owner_id)
-		VALUES ($1, $2, $3, $4, 'STANDARD', $5, NULLIF($6, 0)) RETURNING id`,
-		bid, key, size, sha256hex, diskPath, owner).Scan(&o.ID)
+		INSERT INTO objects (bucket_id, key, size_bytes, sha256, etag, storage_class, disk_path, owner_id)
+		VALUES ($1, $2, $3, $4, NULLIF($5,''), 'STANDARD', $6, NULLIF($7, 0)) RETURNING id`,
+		bid, key, size, sha256hex, etag, diskPath, owner).Scan(&o.ID)
 	if isUniqueViolation(err) {
 		return nil, fmt.Errorf("object %q already exists (v0 has no overwrite)", key)
 	}
@@ -744,11 +754,12 @@ func isMultipart(db *sql.DB, objectID int64) (bool, error) {
 	return n > 0, err
 }
 
-// completeUpload seals the object: upload closed, size = sum of parts,
-// sha256 carries the S3-style multipart ETag ("md5-of-md5s-N") that
-// HEAD/GET report. Per-part sha256s remain the restore verifier.
+// completeUpload seals a multipart upload. The S3-style ETag
+// (md5-of-md5s-N) lives in objects.etag; there is deliberately no
+// whole-file sha256 for multipart objects (the part checksums are
+// the integrity record).
 func completeUpload(db *sql.DB, objectID int64, etag string) error {
-	_, err := db.Exec(`UPDATE objects SET upload_id = NULL, sha256 = $2,
+	_, err := db.Exec(`UPDATE objects SET upload_id = NULL, etag = $2,
 		size_bytes = (SELECT COALESCE(sum(size_bytes),0) FROM object_parts WHERE object_id = $1)
 		WHERE id = $1`, objectID, etag)
 	return err
