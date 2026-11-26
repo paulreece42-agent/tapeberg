@@ -146,6 +146,11 @@ archives are cancelled, buffered disk parts are removed — parts
 already on tape stay as dead bytes that repack reclaims. Ranged GETs
 span part boundaries.
 
+Uploads that are neither completed nor aborted (crashed clients,
+forgotten pipelines) don't linger either: the worker tombstones any
+open upload older than `TAPEBERG_UPLOAD_TTL_DAYS` (default 7 — S3's
+lifecycle "AbortIncompleteMultipartUpload"; 0 disables the sweep).
+
 ```sh
 export TAPEBERG_S3_KEY=... TAPEBERG_S3_SECRET=...
 tapeberg s3                                        # serves :7333, SigV4

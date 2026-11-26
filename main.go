@@ -391,6 +391,7 @@ func LoadConfig() (Config, error) {
 		Pool:        envDefault("TAPEBERG_POOL", "default"),
 		Auth:        envDefault("TAPEBERG_AUTH", "builtin"),
 		RepackThreshold: envIntDefault("TAPEBERG_REPACK_THRESHOLD", 50),
+		UploadTTLDays:   envIntDefault("TAPEBERG_UPLOAD_TTL_DAYS", 7),
 		PartMinBytes: int64(envIntDefault("TAPEBERG_PART_MIN_BYTES", 5<<20)),
 		PartMaxBytes: int64(envIntDefault("TAPEBERG_PART_MAX_BYTES", 5<<30)),
 		Drives:      splitCSV(os.Getenv("TAPEBERG_DRIVES")),
