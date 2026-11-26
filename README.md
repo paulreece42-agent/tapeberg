@@ -132,9 +132,19 @@ aws s3api head-object --bucket tapeberg --key photos.tar   # x-amz-restore: ongo
 s3cmd get s3://tapeberg/photos.tar - | tar xv              # streamed merged read
 ```
 
-Complete computes the S3-style multipart ETag (md5-of-md5s); abort
-drops every catalog trace (parts already on tape become dead space).
-Ranged GETs span part boundaries.
+Part sizes are policy, not just protocol: `TAPEBERG_PART_MIN_BYTES`
+(default 5MiB, S3's floor) and `TAPEBERG_PART_MAX_BYTES` (default 5GiB,
+S3's cap). On real tape, raise the minimum — small parts shoe-shine the
+drive and litter the catalog; 64-128MiB parts keep LTO streaming. The
+minimum applies to every part except the final one and is enforced
+S3-style at CompleteMultipartUpload (`EntityTooSmall`); the maximum is
+rejected per UploadPart (`EntityTooLarge`).
+
+Complete computes the S3-style multipart ETag (md5-of-md5s). Abort is
+a delete: the in-progress object gets a tombstone, queued part
+archives are cancelled, buffered disk parts are removed — parts
+already on tape stay as dead bytes that repack reclaims. Ranged GETs
+span part boundaries.
 
 ```sh
 export TAPEBERG_S3_KEY=... TAPEBERG_S3_SECRET=...

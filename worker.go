@@ -28,6 +28,12 @@ type Config struct {
 	// RepackThreshold is the dead-bytes percentage that makes the
 	// worker rewrite a tape (CTA-style repack). 0 disables.
 	RepackThreshold int
+	// Part size policy (multipart). Min applies to every part except
+	// the final one, enforced S3-style at CompleteMultipartUpload; max
+	// is enforced per UploadPart. On tape rigs raise the minimum —
+	// small parts shoe-shine the drive and litter the catalog.
+	PartMinBytes int64
+	PartMaxBytes int64
 	// Drives are all tape drives available to this rig, in DTE order
 	// (TAPEBERG_DRIVES). RAIT shard stripes write/read in parallel
 	// across them; the first entry is the single-drive path's drive.

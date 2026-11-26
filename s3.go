@@ -860,6 +860,12 @@ func (s *s3srv) putPart(w http.ResponseWriter, r *http.Request, bucket, key stri
 		_ = os.Remove(dst)
 		return errS3("EntityTooSmall", "part size must be > 0 (S3 minimum is 5MB for non-final parts)", http.StatusBadRequest)
 	}
+	if s.cfg.PartMaxBytes > 0 && size > s.cfg.PartMaxBytes {
+		_ = os.Remove(dst)
+		return errS3("EntityTooLarge",
+			fmt.Sprintf("part size %d exceeds the configured maximum %d (TAPEBERG_PART_MAX_BYTES)", size, s.cfg.PartMaxBytes),
+			http.StatusBadRequest)
+	}
 	if err := insertPart(s.db, objID, part, size,
 		hex.EncodeToString(mh.Sum(nil)), hex.EncodeToString(sh.Sum(nil)), dst); err != nil {
 		_ = os.Remove(dst)
@@ -947,6 +953,24 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 		}
 		listed[lp.PartNumber] = true
 	}
+	// S3 contract: every listed part except the FINAL one must meet
+	// the minimum size (on tape, small parts shoe-shine the drive).
+	// The highest listed part number is final.
+	maxPart := 0
+	for _, lp := range req.Parts {
+		if lp.PartNumber > maxPart {
+			maxPart = lp.PartNumber
+		}
+	}
+	for _, lp := range req.Parts {
+		p := byNumber[lp.PartNumber]
+		if lp.PartNumber != maxPart && s.cfg.PartMinBytes > 0 && p.Size < s.cfg.PartMinBytes {
+			return errS3("EntityTooSmall",
+				fmt.Sprintf("part %d is %d bytes; non-final parts must be at least %d (TAPEBERG_PART_MIN_BYTES)",
+					lp.PartNumber, p.Size, s.cfg.PartMinBytes),
+				http.StatusBadRequest)
+		}
+	}
 	for _, p := range parts {
 		if !listed[p.Number] {
 			if _, err := s.db.Exec(`DELETE FROM archive_requests
@@ -954,6 +978,9 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 				return err
 			}
 			if _, err := s.db.Exec(`DELETE FROM tape_files WHERE object_id = $1 AND part_number = $2`, objID, p.Number); err != nil {
+				return err
+			}
+			if _, err := s.db.Exec(`DELETE FROM object_shards WHERE object_id = $1 AND part_number = $2`, objID, p.Number); err != nil {
 				return err
 			}
 			if p.DiskPath != "" {
@@ -998,22 +1025,19 @@ func (s *s3srv) abortMultipart(w http.ResponseWriter, r *http.Request, bucket, k
 	if !canSee(s.user(r), owner) {
 		return errS3("AccessDenied", "access denied", http.StatusForbidden)
 	}
-	// Parts already written to tape become dead space (v0 has no
-	// reclamation); every catalog trace goes away.
-	parts, _ := listParts(s.db, objID)
-	for _, p := range parts {
-		if p.DiskPath != "" {
-			_ = os.Remove(p.DiskPath)
-		}
-	}
-	if _, err := s.db.Exec(`DELETE FROM tape_files WHERE object_id = $1`, objID); err != nil {
+	// Abort kills the in-progress object the same way a delete kills
+	// a finished one: a tombstone. Queued/assigned part archives are
+	// cancelled; buffered disk parts are removed now; parts already
+	// on tape stay as dead bytes until repack reclaims them (the
+	// worker may even be mid-write — the tombstone is what makes
+	// those bytes dead, so hard-DELETEing here would lose the
+	// accounting AND trip object_shards' foreign key).
+	paths, err := softDeleteObject(s.db, objID)
+	if err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM archive_requests WHERE object_id = $1`, objID); err != nil {
-		return err
-	}
-	if _, err := s.db.Exec(`DELETE FROM objects WHERE id = $1`, objID); err != nil {
-		return err
+	for _, p := range paths {
+		_ = os.Remove(p)
 	}
 	w.WriteHeader(http.StatusNoContent)
 	return nil
