@@ -17,10 +17,16 @@ changer = manual
 files that exist are read, in that order. Setting `TAPEBERG_CONF=<path>`
 **replaces** that search list with the one file — that is how one
 machine runs several workers with different hardware (see
-[model.md](model.md#two-libraries-on-one-node)). A missing file is
-currently skipped *silently*, the explicit one included: a typo in
-`TAPEBERG_CONF` surfaces only as "missing environment: …" for the
-required keys.
+[model.md](model.md#two-libraries-on-one-node)). A missing default file
+is skipped, but the explicit one **must exist**: a typo in
+`TAPEBERG_CONF` is an error (`TAPEBERG_CONF=…: no such file or
+directory`), not a silent fallback to the environment and built-in
+defaults.
+
+**Comments** are whole lines starting with `#`. There are no trailing
+comments: in `s3_listen = 127.0.0.1:7333  # temp`, everything after
+`=` (the `# temp` included) is the value. `#` is not special inside a
+value, so a password containing one needs no quoting.
 
 **Precedence:** environment > conf file > built-in default. A conf file
 never overrides a variable already set in the environment, and when

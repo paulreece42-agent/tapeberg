@@ -14,9 +14,9 @@
 // so a conf file never shadows an explicit env var. Precedence is
 // implemented by only exporting keys the env does not already define.
 //
-// File lookup: $TAPEBERG_CONF if set (replaces the defaults), else
-// /etc/tapeberg.conf then ~/.config/tapeberg.conf (all present files
-// load, in that order; a missing file is skipped, the explicit one too).
+// File lookup: $TAPEBERG_CONF if set (replaces the defaults, and must
+// exist), else /etc/tapeberg.conf then ~/.config/tapeberg.conf (all
+// present files load, in that order; a missing default is skipped).
 // Values may be single- or double-quoted; blank lines and #-comments
 // ignored. Files are meant to be chmod 600 — they carry credentials.
 package main
@@ -37,7 +37,15 @@ func loadConfEnv() error {
 		paths = append(paths, filepath.Join(home, ".config", "tapeberg.conf"))
 	}
 	if p := os.Getenv("TAPEBERG_CONF"); p != "" {
-		paths = []string{p} // explicit path replaces the defaults
+		// An explicit path replaces the defaults and must exist: a typo
+		// used to be skipped silently, leaving that process configured
+		// by whatever the environment and built-in defaults said
+		// (TAPEBERG_POOL=default included) instead of the file meant
+		// for it.
+		if _, err := os.Stat(p); err != nil {
+			return fmt.Errorf("TAPEBERG_CONF=%s: %w", p, err)
+		}
+		paths = []string{p}
 	}
 	for _, p := range paths {
 		if err := exportConfFile(p); err != nil {
