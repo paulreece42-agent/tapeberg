@@ -11,10 +11,16 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d /tmp/tapeberg-s3e2e.XXXXXX)
 BIN="$WORK/tapeberg"
-trap 'rm -rf "$WORK"; [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null || true' EXIT
+trap 'rc=$?; rm -rf "$WORK"; [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null; scratch_catalog_exit $rc' EXIT
 
 say() { printf '\n=== %s ===\n' "$*"; }
 fail() { printf '\nS3 E2E FAIL: %s\n' "$*" >&2; exit 1; }
+. "$ROOT/test/scratch-catalog.sh"
+
+# The test's own endpoint port — never the production endpoint's 7333,
+# so the suite runs beside a live tapeberg-s3.service.
+S3E2E_PORT=${S3E2E_PORT:-7391}
+S3L="127.0.0.1:$S3E2E_PORT"
 
 command -v aws >/dev/null || fail "awscli not installed"
 
@@ -26,8 +32,12 @@ CHANGER_DEV=$(lsscsi -g | awk '$2=="mediumx"{print $NF}')
 ST=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1); exit}')
 DRIVE=${ST/\/st/\/nst}
 # All three VTL drives, DTE order — RAIT shards stripe across them in
-# parallel (lsscsi lists them in SCSI target order: DTE 0, 1, 2).
-DRIVES=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1)}' | sed 's:/st:/nst:' | sort | paste -sd,)
+# parallel. lsscsi lists them in SCSI target order, which IS DTE order
+# (verified: DTE 0/1/2 -> targets 1/2/3). Don't sort by device name: st
+# numbering shuffles across mhvtl restarts (targets 1/2/3 have come up
+# as st3/st1/st2), and a sorted list then writes each shard through a
+# different drive than the one its tape was loaded into.
+DRIVES=$(lsscsi -g | awk '$2=="tape" && $3=="IBM"{print $(NF-1)}' | sed 's:/st:/nst:' | paste -sd,)
 
 set -a; . "$ROOT/.env"; set +a
 # Hermetic: never read the host's /etc/tapeberg.conf (robot mode, no
@@ -39,8 +49,11 @@ export TAPEBERG_DRIVES="$DRIVES"
 export TAPEBERG_BUFFER="$WORK/buffer"
 export TAPEBERG_S3_KEY="tapeberg-test" TAPEBERG_S3_SECRET="tapeberg-test-secret"
 mkdir -p "$TAPEBERG_BUFFER"
+
+say "isolating the catalog (scratch schema — the real catalog's rows are never touched)"
+scratch_catalog_up
 PSQL="psql $TAPEBERG_DB_URL -tAq"
-AWS="aws --endpoint-url http://127.0.0.1:7333 --region us-east-1"
+AWS="aws --endpoint-url http://$S3L --region us-east-1"
 
 say "blanking VTL media + resetting catalog together (they MUST stay in sync)"
 mtx -f "$CHANGER_DEV" unload >/dev/null 2>&1 || true  # tolerate a leftover load
@@ -67,12 +80,12 @@ UPDATE tape_pools SET ec_k=NULL, ec_m=NULL;
 DELETE FROM objects WHERE key LIKE 's3e2e%';" >/dev/null
 
 say "starting the S3 endpoint"
-if ss -ltn 2>/dev/null | grep -q ':7333 '; then
-  fail "port 7333 already in use — a production s3 server? Stop it first; running the test against it would write test data into the real catalog"
+if ss -ltn 2>/dev/null | grep -q ":$S3E2E_PORT "; then
+  fail "port $S3E2E_PORT already in use — set S3E2E_PORT to a free port"
 fi
-"$BIN" s3 127.0.0.1:7333 &
+"$BIN" s3 "$S3L" &
 SRV_PID=$!
-for _ in $(seq 1 30); do curl -s -o /dev/null http://127.0.0.1:7333/ && break; sleep 0.5; done
+for _ in $(seq 1 30); do curl -s -o /dev/null "http://$S3L/" && break; sleep 0.5; done
 kill -0 $SRV_PID 2>/dev/null || fail "s3 endpoint died at startup"
 
 export AWS_ACCESS_KEY_ID="$TAPEBERG_S3_KEY" AWS_SECRET_ACCESS_KEY="$TAPEBERG_S3_SECRET"
@@ -192,8 +205,8 @@ cat > "$WORK/s3cfg" <<CFG
 [default]
 access_key = $TAPEBERG_S3_KEY
 secret_key = $TAPEBERG_S3_SECRET
-host_base = 127.0.0.1:7333
-host_bucket = 127.0.0.1:7333
+host_base = $S3L
+host_bucket = $S3L
 use_https = False
 enable_multipart = True
 multipart_chunk_size_mb = 5
