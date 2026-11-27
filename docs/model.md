@@ -105,21 +105,26 @@ cron line each:
 # /etc/tapeberg.conf — the real drive
 db_url  = postgres://tapeberg:***@127.0.0.1:5432/tapeberg
 pool    = default
-drive   = /dev/nst0
+drive   = /dev/tape/by-id/scsi-HU1325W88B-nst
 changer = manual
 buffer  = /var/lib/tapeberg
 ```
 
 ```ini
-# /etc/tapeberg-vtl.conf — the VTL
+# /etc/tapeberg-vtl.conf — the VTL (DTE 0/1/2 = TB-DRIVE01/02/03)
 db_url      = postgres://tapeberg:***@127.0.0.1:5432/tapeberg
 pool        = vtl
-drive       = /dev/nst1
-drives      = /dev/nst1,/dev/nst2,/dev/nst3
+drive       = /dev/tape/by-id/scsi-TB-DRIVE01-nst
+drives      = /dev/tape/by-id/scsi-TB-DRIVE01-nst,/dev/tape/by-id/scsi-TB-DRIVE02-nst,/dev/tape/by-id/scsi-TB-DRIVE03-nst
 changer     = robot
-changer_dev = /dev/sch0
+changer_dev = /dev/tape/by-id/scsi-SSPECTRA_PYTHON_TAPEBERG1-changer
 buffer      = /var/lib/tapeberg-vtl
 ```
+
+Name devices by their `/dev/tape/by-id/` serial links, never
+`/dev/nstN` / `/dev/sgN`: kernel numbering reshuffles across reboots,
+and a stale number silently means a different drive
+([config.md](config.md#stable-device-names)).
 
 ```cron
 * * * * * root /usr/local/bin/tapeberg worker >>/var/log/tapeberg.log 2>&1

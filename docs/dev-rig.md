@@ -105,10 +105,13 @@ at most ~1.7 GB). Bump to 1500000 to emulate real LTO-5 (1.5 TB).
   freed one, and restores read the WRONG bytes (caught as a checksum
   mismatch). Test resets erase media (`mt erase`) and reset tape rows
   in the same step.
-- **`/dev/sgN` numbering shuffles across mhvtl restarts** (changer and
-  drive swapped sg2/sg3 after one restart). Never hardcode sgN —
-  discover via `lsscsi -g` at runtime, or address the changer via the
-  type-stable `/dev/sch0`.
+- **`/dev/sgN` and `/dev/nstN` numbering shuffles across mhvtl
+  restarts** (changer and drive swapped sg2/sg3 after one restart; the
+  three drives at targets 1/2/3 have come up as nst3/nst1/nst2). Never
+  hardcode them — discover via `lsscsi -g` at runtime, or use the
+  serial links under `/dev/tape/by-id/` (`scsi-TB-DRIVE0N-nst`,
+  `scsi-SSPECTRA_PYTHON_TAPEBERG1-changer`). Not `/dev/sch0`: `mtx`
+  fails on it with `READ ELEMENT STATUS Command Failed`.
 - After `mtx load`, give the drive a moment (or poll `mt status`) before
   the first write; an immediate write can race the mount.
 

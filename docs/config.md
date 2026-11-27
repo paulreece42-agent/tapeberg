@@ -35,13 +35,44 @@ live in the catalog — see [model.md](model.md).
 | Key | Default | Meaning |
 |---|---|---|
 | `DB_URL` | — **required** | PostgreSQL URL of the catalog ([database.md](database.md)) |
-| `DRIVE` | — **required** | Non-rewinding tape device (`/dev/nstN`) used for every single-stream read/write. Robot mode: must be the library's **DTE 0** drive. Required by *every* command (even `s3` and `user`), so set it on endpoint-only nodes too. |
+| `DRIVE` | — **required** | Non-rewinding tape device used for every single-stream read/write. Robot mode: must be the library's **DTE 0** drive. Required by *every* command (even `s3` and `user`), so set it on endpoint-only nodes too. Use the stable `/dev/tape/by-id/scsi-<serial>-nst` name, not `/dev/nstN` (see *Stable device names* below). |
 | `DRIVES` | unset (= `DRIVE` only) | All of the library's drives, comma-separated, **in DTE order**. Used for parallel RAIT shard writes; the first entry should equal `DRIVE`. |
 | `BUFFER` | — **required** | Disk staging directory. Also holds the worker lock (`.worker.lock`): workers sharing a buffer run one at a time. |
 | `CHANGER` | `robot` | `robot` (autochanger via `mtx`) or `manual` (a human loads tapes when pinged, then runs `tapeberg ack`). |
-| `CHANGER_DEV` | auto-discovered | Robot mode: changer device for `mtx -f`. Prefer `/dev/sch0` over `/dev/sgN` (sg numbers shuffle across restarts). |
+| `CHANGER_DEV` | auto-discovered | Robot mode: the changer for `mtx -f`. Unset = the first `mediumx` device `lsscsi -g` lists — fine with one library, ambiguous with two. Set it to the changer's `/dev/tape/by-id/…-changer` name. **Not** `/dev/schN`: `mtx` fails on it (`READ ELEMENT STATUS Command Failed`). |
 | `ACK_DIR` | `/run/tapeberg` | Manual mode: where the worker writes its prompt and `tapeberg ack` writes the acknowledgement. |
 | `POOL` | `default` | The tape pool this process serves. A **worker** drains only this pool's queues and writes only to this pool's tapes. The **S3 endpoint** binds *new* buckets to it. The **CLI** ingests, restores and `tape add`s into it. |
+
+## Stable device names
+
+Kernel numbering is not stable: `/dev/nstN` and `/dev/sgN` are handed
+out in probe order and reshuffle across reboots and driver reloads (the
+reference rig's VTL drives at SCSI targets 1/2/3 have come up as
+nst1/nst2/nst3 one day and nst3/nst1/nst2 the next). A config naming
+`/dev/nst1` then silently points at a *different drive* — fatal for
+`DRIVES`, where position N must be DTE N.
+
+udev keeps serial-number links that never move, under `/dev/tape/by-id/`
+(`ls -l /dev/tape/by-id/` lists them):
+
+| For | Use | Example (reference rig) |
+|---|---|---|
+| a drive (`DRIVE`, `DRIVES`) | `scsi-<serial>-nst` — the **`-nst`** (non-rewinding) link | `/dev/tape/by-id/scsi-TB-DRIVE01-nst` |
+| the changer (`CHANGER_DEV`) | `scsi-<vendor_model_serial>-changer` | `/dev/tape/by-id/scsi-SSPECTRA_PYTHON_TAPEBERG1-changer` |
+
+Drive links need a binary with #21 (resolves the link before reading
+the loaded tape's barcode); older binaries read no barcode through a
+link, which blinds the manual changer's wrong-tape check.
+
+To find which drive is which DTE, load a tape into each element in turn
+and see which device comes online:
+
+```sh
+CH=/dev/tape/by-id/scsi-SSPECTRA_PYTHON_TAPEBERG1-changer
+mtx -f $CH load <slot> 0     # DTE 0
+for d in /dev/tape/by-id/*-nst; do mt -f $d status 2>/dev/null | grep -q ONLINE && echo "DTE 0 = $d"; done
+mtx -f $CH unload <slot> 0   # repeat for 1, 2, …
+```
 
 ## Policy
 
