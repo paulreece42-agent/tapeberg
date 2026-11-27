@@ -27,10 +27,10 @@ import (
 const usageText = `tapeberg — a personal Glacier on your own tape
 
 usage:
-  tapeberg ingest <src-path> [key]   stage a file for archival (queues it)
-  tapeberg restore <key> [days]      queue a Glacier-style restore (default 1 day, max 30)
-  tapeberg get <key>                 cat a restored object to stdout
-  tapeberg rm <key>                  soft-delete an object (tape bytes reclaimed at repack)
+  tapeberg ingest <src-path> [key] [--bucket B]   stage a file for archival into B's pool (default bucket: tapeberg)
+  tapeberg restore <key> [days] [--bucket B]   queue a Glacier-style restore (default 1 day, max 30)
+  tapeberg get <key> [--bucket B]    cat a restored object to stdout
+  tapeberg rm <key> [--bucket B]     soft-delete an object (tape bytes reclaimed at repack)
   tapeberg tape ls [--pool P] [--state S]   list tapes: pool, state, live/dead bytes
   tapeberg tape add <barcode> [capacity] [--pool P]  register a tape (capacity like 1500GB; default 1500GB, LTO-5; pool default $TAPEBERG_POOL)
   tapeberg tape mv <barcode>... --to <pool>   move tapes (and the objects on them) to another pool/library
@@ -85,36 +85,45 @@ func run(args []string) error {
 
 	switch cmd {
 	case "ingest":
-		if len(rest) < 1 || len(rest) > 2 {
-			return fmt.Errorf("usage: tapeberg ingest <src-path> [key]")
+		bucket, explicit := bucketFlag(rest)
+		pos := positionalArgs(rest)
+		if len(pos) < 1 || len(pos) > 2 {
+			return fmt.Errorf("usage: tapeberg ingest <src-path> [key] [--bucket B]")
 		}
-		key := filepath.Base(rest[0])
-		if len(rest) == 2 {
-			key = rest[1]
+		key := filepath.Base(pos[0])
+		if len(pos) == 2 {
+			key = pos[1]
 		}
 		if key != filepath.Base(key) {
 			return fmt.Errorf("key must not contain path separators (v0)")
 		}
-		return cmdIngest(cfg, rest[0], key)
+		if err := checkObjectKey(key); err != nil {
+			return err
+		}
+		return cmdIngest(cfg, bucket, explicit, pos[0], key)
 
 	case "restore":
-		if len(rest) < 1 || len(rest) > 2 {
-			return fmt.Errorf("usage: tapeberg restore <key> [days]")
+		bucket, _ := bucketFlag(rest)
+		pos := positionalArgs(rest)
+		if len(pos) < 1 || len(pos) > 2 {
+			return fmt.Errorf("usage: tapeberg restore <key> [days] [--bucket B]")
 		}
 		days := 1
-		if len(rest) == 2 {
-			days, err = strconv.Atoi(rest[1])
+		if len(pos) == 2 {
+			days, err = strconv.Atoi(pos[1])
 			if err != nil || days < 1 || days > 30 {
 				return fmt.Errorf("days must be an integer 1-30")
 			}
 		}
-		return cmdRestore(cfg, rest[0], days)
+		return cmdRestore(cfg, bucket, pos[0], days)
 
 	case "get":
-		if len(rest) != 1 {
-			return fmt.Errorf("usage: tapeberg get <key>")
+		bucket, _ := bucketFlag(rest)
+		pos := positionalArgs(rest)
+		if len(pos) != 1 {
+			return fmt.Errorf("usage: tapeberg get <key> [--bucket B]")
 		}
-		return cmdGet(cfg, rest[0])
+		return cmdGet(cfg, bucket, pos[0])
 
 	case "tape":
 		return cmdTape(cfg, rest)
@@ -126,10 +135,12 @@ func run(args []string) error {
 		return cmdKey(cfg, rest)
 
 	case "rm":
-		if len(rest) != 1 {
-			return fmt.Errorf("usage: tapeberg rm <key>")
+		bucket, _ := bucketFlag(rest)
+		pos := positionalArgs(rest)
+		if len(pos) != 1 {
+			return fmt.Errorf("usage: tapeberg rm <key> [--bucket B]")
 		}
-		return cmdRm(cfg, rest[0])
+		return cmdRm(cfg, bucket, pos[0])
 
 	case "pool":
 		return cmdPool(cfg, rest)
@@ -163,23 +174,40 @@ func run(args []string) error {
 	return nil
 }
 
-// cmdIngest copies src into the disk buffer and queues it for tape.
-func cmdIngest(cfg Config, src, key string) error {
+// cmdIngest copies src into the disk buffer and queues it for tape in
+// the bucket's pool — the same rule as S3 PutObject. Without --bucket it
+// targets the CLI's own bucket, and refuses when that bucket's pool is
+// not the one this process serves: archiving there used to follow
+// TAPEBERG_POOL instead, silently filing objects under a bucket whose
+// binding said otherwise.
+func cmdIngest(cfg Config, bucket string, explicit bool, src, key string) error {
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	pool, err := bucketPool(db, bucket)
+	if errors.Is(err, ErrNotFound) {
+		return fmt.Errorf("bucket %q does not exist ('tapeberg bucket ls'; 'tapeberg bucket create %s --pool P')", bucket, bucket)
+	}
+	if err != nil {
+		return err
+	}
+	if !explicit && pool != cfg.Pool {
+		return fmt.Errorf("bucket %q archives to pool %q, but this process serves pool %q (TAPEBERG_POOL) — "+
+			"pass --bucket for a bucket bound to %q ('tapeberg bucket create <name> --pool %s'), or rebind with 'tapeberg bucket set-pool %s %s'",
+			bucket, pool, cfg.Pool, cfg.Pool, cfg.Pool, bucket, cfg.Pool)
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	obj, err := ingestStream(db, cfg, "tapeberg", key, in, cfg.Pool, 0)
+	obj, err := ingestStream(db, cfg, bucket, key, in, pool, 0)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("ingested %s (%d bytes, sha256 %s) — queued for tape\n", key, obj.Size, obj.SHA256)
+	fmt.Printf("ingested %s into bucket %s (%d bytes, sha256 %s) — queued for pool %s\n", key, bucket, obj.Size, obj.SHA256, pool)
 	return nil
 }
 
@@ -230,14 +258,14 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool 
 }
 
 // cmdRestore queues a Glacier-style restore job for the object.
-func cmdRestore(cfg Config, key string, days int) error {
+func cmdRestore(cfg Config, bucket, key string, days int) error {
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	obj, err := getObjectIn(db, "tapeberg", key)
+	obj, err := getObjectIn(db, bucket, key)
 	if err != nil {
 		return err
 	}
@@ -255,14 +283,14 @@ func cmdRestore(cfg Config, key string, days int) error {
 
 // cmdGet streams a restored object to stdout; a tape-only object refuses,
 // mirroring S3 Glacier's InvalidObjectState.
-func cmdGet(cfg Config, key string) error {
+func cmdGet(cfg Config, bucket, key string) error {
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	obj, err := getObjectIn(db, "tapeberg", key)
+	obj, err := getObjectIn(db, bucket, key)
 	if err != nil {
 		return err
 	}
@@ -276,7 +304,7 @@ func cmdGet(cfg Config, key string) error {
 		}
 		for _, p := range parts {
 			if p.DiskPath == "" {
-				return fmt.Errorf("InvalidObjectState: object is in storage class %s — run 'tapeberg restore %s' first", obj.StorageClass, key)
+				return fmt.Errorf("InvalidObjectState: object is in storage class %s — run 'tapeberg restore %s' first", obj.StorageClass, restoreArgs(bucket, key))
 			}
 		}
 		for _, p := range parts {
@@ -293,7 +321,7 @@ func cmdGet(cfg Config, key string) error {
 		return nil
 	}
 	if obj.StorageClass != "STANDARD" || obj.DiskPath == "" {
-		return fmt.Errorf("InvalidObjectState: object is in storage class %s — run 'tapeberg restore %s' first", obj.StorageClass, key)
+		return fmt.Errorf("InvalidObjectState: object is in storage class %s — run 'tapeberg restore %s' first", obj.StorageClass, restoreArgs(bucket, key))
 	}
 	f, err := os.Open(obj.DiskPath)
 	if err != nil {
@@ -377,20 +405,6 @@ func cmdTape(cfg Config, args []string) error {
 	if len(args) < 1 {
 		return errors.New(usage)
 	}
-	// Positional arguments, with "--flag value" pairs removed.
-	positional := func(from []string) []string {
-		var out []string
-		for i := 0; i < len(from); i++ {
-			if strings.HasPrefix(from[i], "--") {
-				if !strings.Contains(from[i], "=") {
-					i++ // skip the flag's value
-				}
-				continue
-			}
-			out = append(out, from[i])
-		}
-		return out
-	}
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
@@ -419,7 +433,7 @@ func cmdTape(cfg Config, args []string) error {
 		}
 		return nil
 	case "add":
-		pos := positional(args[1:])
+		pos := positionalArgs(args[1:])
 		if len(pos) < 1 || len(pos) > 2 {
 			return fmt.Errorf("usage: tapeberg tape add <barcode> [capacity] [--pool P]")
 		}
@@ -441,7 +455,7 @@ func cmdTape(cfg Config, args []string) error {
 		return nil
 	case "mv":
 		to, ok := flagValue(args, "--to")
-		barcodes := positional(args[1:])
+		barcodes := positionalArgs(args[1:])
 		if !ok || to == "" || len(barcodes) == 0 {
 			return fmt.Errorf("usage: tapeberg tape mv <barcode>... --to <pool>")
 		}
@@ -696,13 +710,13 @@ func cmdKey(cfg Config, args []string) error {
 // cmdRm soft-deletes an object from the CLI's 'tapeberg' bucket —
 // same semantics as S3 DeleteObject: tombstone now, tape bytes
 // reclaimed when the worker's repack pass rewrites the tape.
-func cmdRm(cfg Config, key string) error {
+func cmdRm(cfg Config, bucket, key string) error {
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	obj, err := getObjectIn(db, "tapeberg", key)
+	obj, err := getObjectIn(db, bucket, key)
 	if err != nil {
 		fmt.Printf("%s: already gone (no such object)\n", key)
 		return nil
@@ -872,4 +886,37 @@ func cmdBucket(cfg Config, args []string) error {
 	default:
 		return fmt.Errorf("unknown bucket subcommand %q (have: ls create set-pool rm)", args[0])
 	}
+}
+
+// positionalArgs returns args with "--flag value" / "--flag=value" pairs
+// removed. Every CLI flag takes a value.
+func positionalArgs(args []string) []string {
+	var out []string
+	for i := 0; i < len(args); i++ {
+		if strings.HasPrefix(args[i], "--") {
+			if !strings.Contains(args[i], "=") {
+				i++ // skip the flag's value
+			}
+			continue
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
+
+// bucketFlag reads --bucket (default: the CLI's own bucket) and reports
+// whether it was given explicitly.
+func bucketFlag(args []string) (bucket string, explicit bool) {
+	if b, ok := flagValue(args, "--bucket"); ok && b != "" {
+		return b, true
+	}
+	return cliBucket, false
+}
+
+// restoreArgs renders the restore command a user should run.
+func restoreArgs(bucket, key string) string {
+	if bucket == cliBucket {
+		return key
+	}
+	return key + " --bucket " + bucket
 }

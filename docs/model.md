@@ -45,10 +45,11 @@ belongs together*; each node's config says *what this box can reach*.
   drains only requests whose `pool` equals its `TAPEBERG_POOL`, and
   picks tapes only from that pool. Nothing else connects a pool to
   hardware.
-- **Archive requests are stamped with a pool when queued.** S3
-  PutObject and multipart parts use the **bucket's** pool. CLI
-  `tapeberg ingest` uses the shell's **`TAPEBERG_POOL`** — not the
-  `tapeberg` bucket's pool (see caveats).
+- **Archive requests are stamped with the bucket's pool when queued**,
+  from S3 (PutObject, multipart parts) and the CLI alike
+  (`tapeberg ingest … --bucket B`; default bucket `tapeberg`). Without
+  `--bucket`, the CLI refuses when the `tapeberg` bucket's pool isn't
+  the shell's `TAPEBERG_POOL`, rather than guess which one was meant.
 - **Restore requests go where the object's tapes are.** The pool is
   resolved from the object's tape placement; the bucket's pool (S3) or
   `TAPEBERG_POOL` (CLI) is only the fallback for an object not yet on
@@ -89,9 +90,8 @@ tapeberg bucket create photos-offsite --pool offsite
 tapeberg pool ls
 ```
 
-Then give the pool a worker (next recipe). CLI ingests go to the
-shell's `TAPEBERG_POOL`, so `TAPEBERG_POOL=offsite tapeberg ingest …`
-also archives into it.
+Then give the pool a worker (next recipe). From the CLI,
+`tapeberg ingest file.tar --bucket photos-offsite` archives into it.
 
 ### Two libraries on one node
 
@@ -183,9 +183,10 @@ tape).
 
 ## Caveats (known gaps)
 
-- **CLI ingest ignores the bucket's pool**; it uses `TAPEBERG_POOL`, so
-  the `tapeberg` bucket can end up spanning several pools. (Restores
-  cope; the bucket's binding is just misleading.)
+- **Older catalogs may hold mixed buckets.** Before `--bucket`, CLI
+  ingest archived to `TAPEBERG_POOL` whatever the `tapeberg` bucket's
+  binding said, so that bucket can hold objects on several pools'
+  tapes. Restores still find them (they follow placement).
 - **`bucket rm` only removes buckets that never held objects.** Deleted
   objects keep their catalog row as a tombstone, so a bucket that held
   anything can't be dropped yet.

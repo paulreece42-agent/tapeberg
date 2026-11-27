@@ -56,8 +56,9 @@ tapeberg bucket create photos --pool offsite
 tapeberg bucket set-pool photos default   # new archives go to default's tapes
 ```
 
-The CLI's ingest/get/rm work on its own bucket, `tapeberg`; other
-buckets' objects are S3-only.
+The CLI's ingest/restore/get/rm work on its own bucket, `tapeberg`, by
+default; `--bucket B` targets any other (ingest then archives into B's
+pool, like S3 PutObject).
 
 ## Pools, buckets and drives
 

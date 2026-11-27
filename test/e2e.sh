@@ -76,6 +76,15 @@ for i in 1 2 3 4 5; do
   dd if=/dev/urandom of="$WORK/src$i" bs=1M count=20 status=none
 done
 
+say "CLI ingest follows the bucket's pool"
+# The scratch catalog's 'tapeberg' bucket is seeded into 'default'; this
+# rig's worker serves 'vtl'. Ingesting without --bucket must refuse the
+# mismatch rather than file a vtl archive under a default-bound bucket.
+if "$BIN" ingest "$WORK/src1" e2e-mismatch 2>"$WORK/mismatch"; then fail "ingest into a bucket bound to another pool must be refused"; fi
+grep -- '--bucket' "$WORK/mismatch" >/dev/null || fail "mismatch refusal should point at --bucket: $(cat "$WORK/mismatch")"
+echo "  refused: $(cat "$WORK/mismatch")"
+"$BIN" bucket set-pool tapeberg vtl >/dev/null || fail "rebind tapeberg -> vtl (scratch catalog)"
+
 say "ingesting 5 objects"
 for i in 1 2 3 4 5; do "$BIN" ingest "$WORK/src$i" "e2e-file$i"; done
 p=$($PSQL -c "SELECT count(*) FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE r.state='pending' AND o.key LIKE 'e2e-%'")
@@ -297,5 +306,30 @@ $PSQL -c "DELETE FROM tapes WHERE barcode='E2E901L5'" >/dev/null
 "$BIN" pool rm e2e-tp >/dev/null || fail "e2e-tp should be removable once empty"
 "$BIN" tape ls --pool vtl
 echo "tape admin: ls, add --pool, set-state, reuse, mv (atomic sets, no pool splits, no in-flight moves)"
+
+say "--bucket: ingest/get/restore/rm in another bucket"
+"$BIN" bucket create e2e-alt --pool vtl >/dev/null || fail "bucket create e2e-alt"
+refuses "$BIN" ingest "$WORK/src1" e2e-x --bucket e2e-nope
+printf 'alt-bytes' > "$WORK/alt"
+out=$("$BIN" ingest "$WORK/alt" e2e-file1 --bucket e2e-alt) || fail "ingest --bucket e2e-alt failed"
+echo "$out" | grep 'into bucket e2e-alt.*queued for pool vtl' >/dev/null || fail "ingest --bucket output: $out"
+# Same key in two buckets: independent objects, independent staged bytes.
+[ "$("$BIN" get e2e-file1 --bucket e2e-alt)" = alt-bytes ] || fail "get --bucket e2e-alt e2e-file1 returned the wrong bytes"
+[ "$($PSQL -c "SELECT count(*) FROM objects WHERE key='e2e-file1' AND deleted_at IS NULL")" = 2 ] || fail "e2e-file1 should exist in both buckets"
+# An explicit --bucket follows the bucket's pool, whatever TAPEBERG_POOL says.
+TAPEBERG_POOL=e2e-misroute "$BIN" ingest "$WORK/alt" e2e-alt2 --bucket e2e-alt >/dev/null || fail "ingest --bucket with a different TAPEBERG_POOL"
+[ "$($PSQL -c "SELECT r.pool FROM archive_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='e2e-alt2' AND r.state='pending'")" = vtl ] \
+  || fail "ingest --bucket e2e-alt should queue for the bucket's pool (vtl)"
+# restore/get hints carry the bucket.
+$PSQL -c "UPDATE objects SET storage_class='GLACIER', disk_path=NULL WHERE key='e2e-alt2'" >/dev/null   # fabricate: archived
+refuses "$BIN" get e2e-alt2 --bucket e2e-alt
+grep -- "restore e2e-alt2 --bucket e2e-alt" "$WORK/refusal" >/dev/null || fail "get hint should include --bucket: $(cat "$WORK/refusal")"
+refuses "$BIN" get e2e-alt2                                        # not in the default bucket
+# rm hits only the named bucket.
+"$BIN" rm e2e-file1 --bucket e2e-alt >/dev/null || fail "rm --bucket"
+[ "$($PSQL -c "SELECT b.name FROM objects o JOIN buckets b ON b.id=o.bucket_id WHERE o.key='e2e-file1' AND o.deleted_at IS NULL")" = tapeberg ] \
+  || fail "rm --bucket e2e-alt must leave tapeberg/e2e-file1 alone"
+"$BIN" rm e2e-alt2 --bucket e2e-alt >/dev/null || fail "rm e2e-alt2"
+echo "--bucket: per-bucket keys, bucket's pool decides, hints and rm scoped to the bucket"
 
 printf '\nE2E PASS — all basic functions verified\n'
