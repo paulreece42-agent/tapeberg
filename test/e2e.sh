@@ -233,4 +233,69 @@ refuses "$BIN" bucket rm tapeberg                    # the CLI ingest bucket
 "$BIN" bucket ls
 echo "pool/bucket admin: create, bind, rebind, refuse-when-in-use, remove"
 
+say "tape admin CLI"
+taperow() { "$BIN" tape ls | awk -F'\t' -v t="$1" '$1==t'; }
+tapeid() { $PSQL -c "SELECT id FROM tapes WHERE barcode='$1'"; }
+# A vtl tape holding live data by now, and an empty active one.
+LIVE=$($PSQL -c "SELECT t.barcode FROM tapes t JOIN tape_files tf ON tf.tape_id=t.id JOIN objects o ON o.id=tf.object_id AND o.deleted_at IS NULL ORDER BY t.barcode LIMIT 1")
+EMPTY=$($PSQL -c "SELECT barcode FROM tapes t WHERE state='active' AND NOT is_cleaning AND barcode <> '$LIVE' AND NOT EXISTS (SELECT 1 FROM tape_files tf WHERE tf.tape_id=t.id) ORDER BY barcode DESC LIMIT 1")
+[ -n "$LIVE" ] && [ -n "$EMPTY" ] || fail "fixture: need a live and an empty vtl tape (live='$LIVE' empty='$EMPTY')"
+echo "  live tape $LIVE, empty tape $EMPTY"
+
+[ "$("$BIN" tape ls --pool vtl | wc -l)" = 17 ] || fail "tape ls --pool vtl should list the 17 seeded tapes"
+taperow "$LIVE" | grep 'pool vtl' | grep -v '\b0 live file' >/dev/null || fail "tape ls row for $LIVE: '$(taperow "$LIVE")'"
+
+refuses "$BIN" tape add E2E901L5 100GB --pool e2e-tp            # no such pool
+"$BIN" pool add e2e-tp >/dev/null
+out=$("$BIN" tape add E2E901L5 100GB --pool e2e-tp) || fail "tape add --pool failed"
+echo "$out" | grep 'pool e2e-tp' >/dev/null || fail "tape add must report the pool it used: $out"
+[ "$($PSQL -c "SELECT p.name FROM tapes t JOIN tape_pools p ON p.id=t.pool_id WHERE barcode='E2E901L5'")" = e2e-tp ] || fail "E2E901L5 not in e2e-tp"
+refuses "$BIN" tape add E2E901L5 --pool e2e-tp
+
+# set-state: active <-> full; retire only when empty; retired comes back via reuse.
+"$BIN" tape set-state E2E901L5 full >/dev/null && "$BIN" tape set-state E2E901L5 active >/dev/null || fail "active<->full"
+refuses "$BIN" tape set-state E2E901L5 active                     # already
+refuses "$BIN" tape set-state E2E901L5 lost                       # not offered
+refuses "$BIN" tape set-state "$LIVE" retired                     # live data
+"$BIN" tape set-state E2E901L5 retired >/dev/null || fail "retire an empty tape"
+refuses "$BIN" tape set-state E2E901L5 active                     # retired: use reuse
+refuses "$BIN" tape add E2E901L5 --pool e2e-tp                    # message points at reuse
+grep 'tape reuse' "$WORK/refusal" >/dev/null || fail "re-adding a retired tape should point at 'tape reuse'"
+
+# reuse: retired + fully dead only; drops the dead placement rows.
+refuses "$BIN" tape reuse "$EMPTY"                                # not retired
+$PSQL -c "INSERT INTO objects (bucket_id, key, size_bytes, deleted_at) SELECT id, 'e2e-tombstone', 7, now() FROM buckets WHERE name='tapeberg'" >/dev/null
+$PSQL -c "INSERT INTO tape_files (tape_id, object_id, archive_id, physical_file, size_bytes) SELECT $(tapeid E2E901L5), id, 1, 1, 7 FROM objects WHERE key='e2e-tombstone'" >/dev/null
+$PSQL -c "UPDATE tapes SET written_bytes=7 WHERE barcode='E2E901L5'" >/dev/null
+out=$("$BIN" tape reuse E2E901L5) || fail "tape reuse failed"
+echo "$out" | grep '1 stale placement' >/dev/null || fail "reuse should drop the tombstone's placement: $out"
+[ "$($PSQL -c "SELECT state||':'||written_bytes FROM tapes WHERE barcode='E2E901L5'")" = active:0 ] || fail "reused tape should be active and empty"
+[ "$($PSQL -c "SELECT count(*) FROM tape_files WHERE tape_id=$(tapeid E2E901L5)")" = 0 ] || fail "reuse left placement rows"
+$PSQL -c "UPDATE tapes SET state='retired' WHERE barcode='$LIVE'" >/dev/null   # fabricate: retired yet live
+refuses "$BIN" tape reuse "$LIVE"
+$PSQL -c "UPDATE tapes SET state='active' WHERE barcode='$LIVE'" >/dev/null
+
+# mv: never splits an object across pools; moves sets atomically; refuses in-flight tapes.
+OBJ=$($PSQL -c "SELECT tf.object_id FROM tape_files tf JOIN objects o ON o.id=tf.object_id AND o.deleted_at IS NULL WHERE tf.tape_id=$(tapeid "$LIVE") LIMIT 1")
+$PSQL -c "INSERT INTO tape_files (tape_id, object_id, part_number, archive_id, physical_file, size_bytes) VALUES ($(tapeid "$EMPTY"), $OBJ, 99, 1, 1, 1)" >/dev/null
+refuses "$BIN" tape mv "$LIVE" --to e2e-tp                        # its object also lives on $EMPTY
+grep 'split objects across pools' "$WORK/refusal" >/dev/null || fail "mv should explain the split"
+[ "$($PSQL -c "SELECT p.name FROM tapes t JOIN tape_pools p ON p.id=t.pool_id WHERE barcode='$LIVE'")" = vtl ] || fail "refused mv must not move anything"
+"$BIN" tape mv "$LIVE" "$EMPTY" --to e2e-tp >/dev/null || fail "moving the whole set should work"
+[ "$($PSQL -c "SELECT count(*) FROM tapes t JOIN tape_pools p ON p.id=t.pool_id WHERE p.name='e2e-tp' AND barcode IN ('$LIVE','$EMPTY')")" = 2 ] || fail "set not moved"
+"$BIN" tape mv "$LIVE" "$EMPTY" --to vtl >/dev/null || fail "move the set back"
+$PSQL -c "DELETE FROM tape_files WHERE object_id=$OBJ AND part_number=99" >/dev/null
+$PSQL -c "INSERT INTO archive_requests (object_id, state, tape_id, pool) VALUES ($OBJ, 'assigned', $(tapeid "$EMPTY"), 'vtl')" >/dev/null
+refuses "$BIN" tape mv "$EMPTY" --to e2e-tp                       # an archive is being written to it
+refuses "$BIN" tape set-state "$EMPTY" full
+$PSQL -c "DELETE FROM archive_requests WHERE tape_id=$(tapeid "$EMPTY") AND state='assigned'" >/dev/null
+refuses "$BIN" tape mv "$EMPTY" --to vtl                          # already there
+refuses "$BIN" tape mv NOSUCH01 --to vtl
+
+# Leave the catalog as the test found it.
+$PSQL -c "DELETE FROM tapes WHERE barcode='E2E901L5'" >/dev/null
+"$BIN" pool rm e2e-tp >/dev/null || fail "e2e-tp should be removable once empty"
+"$BIN" tape ls --pool vtl
+echo "tape admin: ls, add --pool, set-state, reuse, mv (atomic sets, no pool splits, no in-flight moves)"
+
 printf '\nE2E PASS — all basic functions verified\n'

@@ -34,7 +34,7 @@ belongs together*; each node's config says *what this box can reach*.
 | Link | Stored in | Set by | How to change it today |
 |---|---|---|---|
 | bucket → pool | `buckets.pool` | S3 **CreateBucket**: the bucket binds to the creating endpoint's `TAPEBERG_POOL`. `tapeberg bucket create <name> --pool P` binds explicitly. The CLI's own bucket, `tapeberg`, is seeded into `default`. | `tapeberg bucket set-pool <bucket> <pool>` |
-| tape → pool | `tapes.pool_id` | `tapeberg tape add` puts the tape in the invoking environment's `TAPEBERG_POOL` | No CLI yet — SQL only |
+| tape → pool | `tapes.pool_id` | `tapeberg tape add <barcode> [--pool P]` (default: the invoking environment's `TAPEBERG_POOL`) | `tapeberg tape mv <barcode>... --to <pool>` |
 | pool → EC policy | `tape_pools.ec_k/ec_m` | `tapeberg pool set <pool> --ec-k K --ec-m M` / `--no-ec` | CLI |
 | pool → drives/library | node config | a worker process serves exactly the pool in its `TAPEBERG_POOL`, using its `TAPEBERG_DRIVE(S)` and changer | edit that process's config |
 | pool itself | `tape_pools` | seed (`default`), migration 0004 (`vtl`), `tapeberg pool add <name>` | `tapeberg pool rm <name>` (only when unused) |
@@ -84,7 +84,7 @@ belongs together*; each node's config says *what this box can reach*.
 
 ```sh
 tapeberg pool add offsite --description "second copy set"
-TAPEBERG_POOL=offsite tapeberg tape add TB0101L5 1500GB    # repeat per tape
+tapeberg tape add TB0101L5 1500GB --pool offsite          # repeat per tape
 tapeberg bucket create photos-offsite --pool offsite
 tapeberg pool ls
 ```
@@ -147,32 +147,51 @@ placement). Archives already queued keep the pool they were queued
 for; the command says how many. `tapeberg bucket ls` shows every
 binding and flags one that names a pool that doesn't exist.
 
+### Move tapes to another pool (library)
+
+```sh
+tapeberg tape ls --pool default
+tapeberg tape mv TB0101L5 TB0102L5 --to offsite
+```
+
+Then physically move the cartridges to the library serving `offsite`.
+Restores of their objects queue there from then on (restores follow
+the tape). An object's bytes must stay within one pool, so tapes that
+share objects (RAIT shard sets, multipart objects spread over tapes)
+move together: `tape mv` refuses a set that would split one, naming
+the objects. It also refuses a tape with an archive being written to
+it or a restore reading from it.
+
+### Reuse a retired tape
+
+Repack moves the live files off a mostly-dead tape and marks it
+`retired`. To put the cartridge back in service:
+
+```sh
+mt -f /dev/tape/by-id/scsi-<serial>-nst erase   # recommended; hours on LTO-5
+tapeberg tape reuse TB0007L5
+```
+
+`tape reuse` accepts only a retired tape with no live files. It drops
+the stale placements of deleted objects and resets the tape to an empty
+`active` one. Skipping the erase is safe: writes position by the drive's
+own end-of-data, so new files append after the old ones and read back
+correctly. But the deleted data stays physically on the tape and keeps
+using its capacity. `tape set-state <barcode> full|active|retired` covers
+the remaining manual moves (stop writes, resume them, retire an empty
+tape).
+
 ## Caveats (known gaps)
 
 - **CLI ingest ignores the bucket's pool**; it uses `TAPEBERG_POOL`, so
   the `tapeberg` bucket can end up spanning several pools. (Restores
   cope; the bucket's binding is just misleading.)
-- **Tape management is SQL-only** beyond `tape add`: no tape
-  list/move/state change.
 - **`bucket rm` only removes buckets that never held objects.** Deleted
   objects keep their catalog row as a tombstone, so a bucket that held
   anything can't be dropped yet.
-- **Retired tapes can't be re-added.** `tape add` refuses an existing
-  barcode, so "erase and `tape add` again" fails with *already
-  registered*. Until there is a CLI for it, re-activate by SQL — only
-  for a tape repack has `retired` (so no *live* object is left on it),
-  and only after erasing the media (`mt erase`):
-
-  ```sql
-  BEGIN;
-  -- placements of deleted objects still point at the old bytes
-  DELETE FROM tape_files tf USING objects o, tapes t
-   WHERE tf.object_id = o.id AND tf.tape_id = t.id
-     AND t.barcode = 'TB0007L5' AND o.deleted_at IS NOT NULL;
-  UPDATE tapes SET state = 'active', written_bytes = 0, updated_at = now()
-   WHERE barcode = 'TB0007L5' AND state = 'retired';
-  COMMIT;
-  ```
+- **No `lost` handling.** `tape set-state` offers active/full/retired
+  only; nothing yet re-archives objects whose only copy was on a tape
+  that's gone.
 - **One library per process.** A node with several libraries needs a
   conf file and a cron line per library (recipe above).
 

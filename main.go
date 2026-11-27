@@ -31,7 +31,11 @@ usage:
   tapeberg restore <key> [days]      queue a Glacier-style restore (default 1 day, max 30)
   tapeberg get <key>                 cat a restored object to stdout
   tapeberg rm <key>                  soft-delete an object (tape bytes reclaimed at repack)
-  tapeberg tape add <barcode> [capacity]  register a tape in the catalog (capacity like 1500GB; default 1500GB, LTO-5)
+  tapeberg tape ls [--pool P] [--state S]   list tapes: pool, state, live/dead bytes
+  tapeberg tape add <barcode> [capacity] [--pool P]  register a tape (capacity like 1500GB; default 1500GB, LTO-5; pool default $TAPEBERG_POOL)
+  tapeberg tape mv <barcode>... --to <pool>   move tapes (and the objects on them) to another pool/library
+  tapeberg tape set-state <barcode> active|full|retired   e.g. stop writes to a tape, or retire an empty one
+  tapeberg tape reuse <barcode>      put a retired, fully dead tape back in service (erase it first)
   tapeberg pool ls                   list pools: tapes by state, bound buckets, usage, EC policy
   tapeberg pool add <name> [--description X]   create a pool (then run a worker with TAPEBERG_POOL=<name>)
   tapeberg pool rm <name>            remove an unused pool (no tapes, buckets or queued work)
@@ -113,10 +117,7 @@ func run(args []string) error {
 		return cmdGet(cfg, rest[0])
 
 	case "tape":
-		if len(rest) != 2 && len(rest) != 3 || rest[0] != "add" {
-			return fmt.Errorf("usage: tapeberg tape add <barcode> [capacity]")
-		}
-		return cmdTapeAdd(cfg, rest[1:])
+		return cmdTape(cfg, rest)
 
 	case "user":
 		return cmdUser(cfg, rest)
@@ -360,37 +361,114 @@ func parseCapacity(s string) (int64, error) {
 	return n, nil
 }
 
-// cmdTapeAdd registers a tape in the catalog (default pool). Capacity is
-// only a scheduling hint — the drive's EOM sense is authoritative.
-func cmdTapeAdd(cfg Config, args []string) error {
-	barcode := args[0]
-	capacity := int64(1500000000000) // LTO-5 native nominal
-	if len(args) == 2 {
-		var err error
-		capacity, err = parseCapacity(args[1])
-		if err != nil {
-			return err
+// cmdTape manages the tape inventory.
+func cmdTape(cfg Config, args []string) error {
+	const usage = "usage: tapeberg tape ls [--pool P] [--state S] | add <barcode> [capacity] [--pool P] | mv <barcode>... --to <pool> | set-state <barcode> active|full|retired | reuse <barcode>"
+	if len(args) < 1 {
+		return errors.New(usage)
+	}
+	// Positional arguments, with "--flag value" pairs removed.
+	positional := func(from []string) []string {
+		var out []string
+		for i := 0; i < len(from); i++ {
+			if strings.HasPrefix(from[i], "--") {
+				if !strings.Contains(from[i], "=") {
+					i++ // skip the flag's value
+				}
+				continue
+			}
+			out = append(out, from[i])
 		}
+		return out
 	}
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	inserted, err := db.Exec(`
-		INSERT INTO tapes (barcode, pool_id, is_cleaning, capacity_bytes)
-		VALUES ($1, (SELECT id FROM tape_pools WHERE name = $2), $3, $4)
-		ON CONFLICT (barcode) DO NOTHING`,
-		barcode, cfg.Pool, strings.HasPrefix(strings.ToUpper(barcode), "CLN"), capacity)
-	if err != nil {
-		return err
+	switch args[0] {
+	case "ls":
+		pool, _ := flagValue(args, "--pool")
+		state, _ := flagValue(args, "--state")
+		tapes, err := listTapes(db, pool, state)
+		if err != nil {
+			return err
+		}
+		for _, t := range tapes {
+			st := t.State
+			if t.Cleaning {
+				st += " (cleaning)"
+			}
+			dead := t.Written - t.LiveBytes
+			if dead < 0 {
+				dead = 0
+			}
+			fmt.Printf("%s\tpool %s\t%s\t%s written of %s\t%d live file(s), %s live, %s dead\n",
+				t.Barcode, t.Pool, st, humanBytes(t.Written), humanBytes(t.CapacityBytes),
+				t.LiveFiles, humanBytes(t.LiveBytes), humanBytes(dead))
+		}
+		return nil
+	case "add":
+		pos := positional(args[1:])
+		if len(pos) < 1 || len(pos) > 2 {
+			return fmt.Errorf("usage: tapeberg tape add <barcode> [capacity] [--pool P]")
+		}
+		capacity := int64(1500000000000) // LTO-5 native nominal
+		if len(pos) == 2 {
+			if capacity, err = parseCapacity(pos[1]); err != nil {
+				return err
+			}
+		}
+		pool := cfg.Pool
+		if p, ok := flagValue(args, "--pool"); ok {
+			pool = p
+		}
+		if err := addTape(db, pos[0], pool, capacity); err != nil {
+			return err
+		}
+		fmt.Printf("registered tape %s (pool %s, capacity hint %s — EOM is authoritative)\n", pos[0], pool, humanBytes(capacity))
+		fmt.Printf("next: put it in the library that serves pool %s, then 'tapeberg doctor' there\n", pool)
+		return nil
+	case "mv":
+		to, ok := flagValue(args, "--to")
+		barcodes := positional(args[1:])
+		if !ok || to == "" || len(barcodes) == 0 {
+			return fmt.Errorf("usage: tapeberg tape mv <barcode>... --to <pool>")
+		}
+		live, err := moveTapes(db, barcodes, to)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("moved %s to pool %s\n", strings.Join(barcodes, ", "), to)
+		if live > 0 {
+			fmt.Printf("they hold %d live file(s): the cartridge(s) must now sit in the library that serves pool %s —\n", live, to)
+			fmt.Println("restores of their objects are queued there from now on")
+		}
+		return nil
+	case "set-state":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: tapeberg tape set-state <barcode> active|full|retired")
+		}
+		if err := setTapeState(db, args[1], args[2]); err != nil {
+			return err
+		}
+		fmt.Printf("tape %s is now %s\n", args[1], args[2])
+		return nil
+	case "reuse":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: tapeberg tape reuse <barcode>")
+		}
+		dropped, err := reuseTape(db, args[1])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("tape %s is active again (empty in the catalog; %d stale placement row(s) of deleted objects dropped)\n", args[1], dropped)
+		fmt.Printf("recommended before it's written: 'mt -f <drive> erase' — the deleted data is still physically on it\n")
+		fmt.Println("and occupies capacity until erased (new writes append after it and stay correct)")
+		return nil
+	default:
+		return fmt.Errorf("unknown tape subcommand %q (have: ls add mv set-state reuse)", args[0])
 	}
-	if n, _ := inserted.RowsAffected(); n == 0 {
-		return fmt.Errorf("tape %s already registered", barcode)
-	}
-	fmt.Printf("registered tape %s (pool default, capacity hint %d bytes — EOM is authoritative)\n", barcode, capacity)
-	fmt.Println("next: 'tapeberg doctor' to verify, then ingest + worker will pick it up")
-	return nil
 }
 
 // LoadConfig reads and validates the environment configuration.

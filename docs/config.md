@@ -41,7 +41,7 @@ live in the catalog — see [model.md](model.md).
 | `CHANGER` | `robot` | `robot` (autochanger via `mtx`) or `manual` (a human loads tapes when pinged, then runs `tapeberg ack`). |
 | `CHANGER_DEV` | auto-discovered | Robot mode: the changer for `mtx -f`. Unset = the first `mediumx` device `lsscsi -g` lists — fine with one library, ambiguous with two. Set it to the changer's `/dev/tape/by-id/…-changer` name. **Not** `/dev/schN`: `mtx` fails on it (`READ ELEMENT STATUS Command Failed`). |
 | `ACK_DIR` | `/run/tapeberg` | Manual mode: where the worker writes its prompt and `tapeberg ack` writes the acknowledgement. |
-| `POOL` | `default` | The tape pool this process serves. A **worker** drains only this pool's queues and writes only to this pool's tapes. The **S3 endpoint** binds *new* buckets to it. The **CLI** ingests, restores and `tape add`s into it. |
+| `POOL` | `default` | The tape pool this process serves. A **worker** drains only this pool's queues and writes only to this pool's tapes. The **S3 endpoint** binds *new* buckets to it. The **CLI** ingests and restores into it, and `tape add` uses it unless `--pool` is given. |
 
 ## Stable device names
 
