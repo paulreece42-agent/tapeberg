@@ -10,7 +10,8 @@ tape TB0003L5" — and waits for `tapeberg ack`.
 Config: any `TAPEBERG_*` env var can live in a conf file instead —
 `/etc/tapeberg.conf` or `~/.config/tapeberg.conf` (or `$TAPEBERG_CONF`),
 `key = value` lines, keys minus the prefix. Env vars override the file;
-chmod 600 (it carries credentials):
+chmod 600 (it carries credentials). Every key is listed in
+[docs/config.md](docs/config.md):
 
 ```ini
 db_url = postgres://tapeberg:...@127.0.0.1:5432/tapeberg
@@ -43,9 +44,33 @@ tapeberg ingest file.tar          # stage + queue for tape
 tapeberg worker                   # drain archive/restore queues, once
 tapeberg restore file.tar 3       # Glacier restore, pinned 3 days
 tapeberg get file.tar > out       # errors InvalidObjectState until restored
+tapeberg rm file.tar              # soft delete (tape bytes reclaimed by repack)
 tapeberg status
 tapeberg ack TB0003L5             # manual changer: "tape is in the drive"
+tapeberg tape add TB0004L5 1500GB # register media into $TAPEBERG_POOL
+tapeberg pool ls                  # pools, tape counts, EC policy
 ```
+
+The CLI works on its own bucket, `tapeberg`; other buckets are S3-only.
+
+## Pools, buckets and drives
+
+The catalog holds the **logical** layout; each node's config holds the
+**physical** one — so a catalog can one day be shared by several
+machines without carrying device paths that only mean something on
+one of them.
+
+- A **pool** is a set of tapes (plus its erasure-coding policy).
+- A **bucket** is bound to one pool: its new archives go to that
+  pool's tapes. CreateBucket binds the endpoint's `TAPEBERG_POOL`.
+- A **tape** belongs to one pool (`tape add` uses `TAPEBERG_POOL`).
+- A **worker** serves exactly one pool with exactly one library — the
+  `TAPEBERG_POOL`, `TAPEBERG_DRIVE(S)` and changer in its config. A
+  node with two libraries runs two workers, each with its own conf
+  file and buffer.
+
+Recipes (adding a pool, two libraries on one node, rebinding a bucket)
+and the current gaps are in [docs/model.md](docs/model.md).
 
 ## Auth (users, keys, tenancy)
 
@@ -109,10 +134,10 @@ freed. Erase a retired tape and `tape add` it to reuse the media.
 
 ## S3 (awscli)
 
-Buckets bind to tape pools: CreateBucket binds the serving rig's pool
-(`TAPEBERG_POOL`), and PutObject/RestoreObject queue in the bucket's
-pool — so bucket = pool = tape set. `tapeberg doctor` reports the
-catalog's buckets.
+Buckets bind to tape pools: CreateBucket binds the serving endpoint's
+pool (`TAPEBERG_POOL`), and PutObject/RestoreObject queue in the
+bucket's pool — so a bucket maps to one tape set (see
+[docs/model.md](docs/model.md)).
 
 ### Multipart (files larger than a single tape)
 
@@ -164,14 +189,16 @@ $AWS s3api restore-object --bucket tapeberg --key foo --restore-request Days=2
 # after a worker pass: get-object succeeds, head-object shows ongoing-request="false"
 ```
 
-Multipart upload is not supported yet — use `s3api put-object` (or raise
-awscli's multipart threshold).
-
 ## Status
 
-Works (e2e-tested on an mhvtl LTO-5 rig): ingest → tape → GLACIER →
-restore → pin expiry; EOM retry and tape swaps; the S3 Glacier contract
-via awscli (SigV4, InvalidObjectState, RestoreObject, x-amz-restore);
-manual changer with Telegram/webhook alerts; `doctor`.
+Works (e2e-tested on an mhvtl LTO-5 rig, and run on a real LTO-5):
+ingest → tape → GLACIER → restore → pin expiry; EOM retry and
+tape swaps; the S3 Glacier contract via awscli and s3cmd (SigV4,
+InvalidObjectState, RestoreObject, x-amz-restore); multipart uploads;
+soft delete + repack; RAIT erasure coding with parallel multi-drive
+writes; users, keys and tenancy; manual changer with Telegram/webhook
+alerts; `doctor`.
 
-Not yet: multipart, DeleteObject, versioning, presigned URLs, repack.
+Not yet: versioning, presigned URLs, DeleteBucket, CLI management of
+pools/buckets/tapes, sharing one catalog between nodes — see
+[docs/model.md](docs/model.md#caveats-known-gaps).
