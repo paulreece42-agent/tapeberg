@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -59,12 +60,27 @@ type sgIOHdr struct {
 // driveSGNode finds the SCSI-generic node for an st device, e.g.
 // /dev/nst0 → /dev/sg1, by parsing `lsscsi -g`.
 func driveSGNode(drive string) (string, error) {
-	st := strings.TrimPrefix(drive, "/dev/n") // nst0 → st0
 	out, err := exec.Command("lsscsi", "-g").CombinedOutput()
 	if err != nil {
 		return "", err
 	}
-	for _, line := range strings.Split(string(out), "\n") {
+	return sgNodeFromLsscsi(string(out), drive)
+}
+
+// sgNodeFromLsscsi maps a drive path to its sg node in `lsscsi -g`
+// output. The path may be a udev link (/dev/tape/by-id/scsi-<serial>-nst
+// → ../../nst3): it is resolved first, because lsscsi only ever prints
+// the kernel names (/dev/st3), and a link left unresolved matched
+// nothing — which silently disabled the manual changer's barcode checks
+// (no "already loaded", no wrong-tape detection) for anyone following
+// the advice to name drives by their stable serial link.
+func sgNodeFromLsscsi(out, drive string) (string, error) {
+	dev := drive
+	if p, err := filepath.EvalSymlinks(drive); err == nil {
+		dev = p
+	}
+	st := "/dev/" + strings.TrimPrefix(filepath.Base(dev), "n") // nst0 → /dev/st0
+	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
 			continue
@@ -74,7 +90,7 @@ func driveSGNode(drive string) (string, error) {
 			continue
 		}
 		for _, f := range fields {
-			if f == "/dev/"+st {
+			if f == st {
 				return last, nil
 			}
 		}
