@@ -393,6 +393,12 @@ func (s *s3srv) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(context.WithValue(r.Context(), userCtxKey{}, u))
 	path := strings.TrimPrefix(r.URL.Path, "/")
 	bucket, key, _ := strings.Cut(path, "/")
+	if key != "" {
+		if err := checkObjectKey(key); err != nil {
+			writeS3Error(w, err)
+			return
+		}
+	}
 
 	switch {
 	case bucket == "":

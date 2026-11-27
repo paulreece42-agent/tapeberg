@@ -95,6 +95,49 @@ $AWS s3api create-bucket --bucket vtl || fail "create-bucket failed"
 bp=$($PSQL -c "SELECT pool FROM buckets WHERE name='vtl'")
 [ "$bp" = vtl ] || fail "bucket vtl should be bound to pool vtl, got '$bp'"
 
+say "object keys never become filesystem paths (path-traversal regression)"
+# Signed raw requests: curl --path-as-is keeps '..' exactly as an attacker
+# would send it (awscli/botocore may normalize). The endpoint has no
+# ServeMux, so nothing upstream cleans the path for us.
+$AWS s3api create-bucket --bucket s3e2e-keys >/dev/null || fail "create-bucket s3e2e-keys"
+SIGCURL=(curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$TAPEBERG_S3_KEY:$TAPEBERG_S3_SECRET")
+# Control: a legit nested key, signed the same way, must work (and used
+# to fail: staging at BUFFER/<key> needed the key's directories to exist).
+code=$("${SIGCURL[@]}" -X PUT --data-binary 'nested-ok' -o "$WORK/nested.out" -w '%{http_code}' "http://$S3L/s3e2e-keys/dir/sub/file.txt")
+[ "$code" = 200 ] || fail "signed PUT of nested key dir/sub/file.txt: HTTP $code $(cat "$WORK/nested.out")"
+dp=$($PSQL -c "SELECT o.disk_path FROM objects o JOIN buckets b ON b.id=o.bucket_id WHERE b.name='s3e2e-keys' AND o.key='dir/sub/file.txt' AND o.deleted_at IS NULL")
+case "$dp" in "$TAPEBERG_BUFFER"/obj-*) ;; *) fail "nested key staged at '$dp', want $TAPEBERG_BUFFER/obj-*";; esac
+[ "$(cat "$dp")" = nested-ok ] || fail "staged bytes of the nested key differ"
+for variant in "../escape-1" "a/../../escape-3"; do
+  code=$("${SIGCURL[@]}" --path-as-is -X PUT --data-binary 'PWNED' -o "$WORK/trav.out" -w '%{http_code}' "http://$S3L/s3e2e-keys/$variant")
+  [ "$code" = 400 ] && grep -q InvalidArgument "$WORK/trav.out" \
+    || fail "signed traversal key '$variant' not refused with 400 InvalidArgument: HTTP $code $(cat "$WORK/trav.out")"
+done
+# The same attack against an UNSIGNED dev-mode endpoint — no users and no
+# static key, which is how a fresh install (and the reference rig) runs.
+# There auth lets everything through, so the key check is all that stands
+# between a request and the filesystem; '%2F' variants (which signing
+# canonicalizes differently) reach it too. Must run before any user exists.
+DEVPORT=$((S3E2E_PORT + 2))
+[ "$($PSQL -c "SELECT count(*) FROM s3_users")" = 0 ] || fail "dev-mode probe needs a catalog without users"
+env -u TAPEBERG_S3_KEY -u TAPEBERG_S3_SECRET "$BIN" s3 "127.0.0.1:$DEVPORT" > "$WORK/devsrv.log" 2>&1 &
+DEV_PID=$!
+for _ in $(seq 1 30); do curl -s -o /dev/null "http://127.0.0.1:$DEVPORT/" && break; sleep 0.3; done
+grep -q 'UNSIGNED dev mode' "$WORK/devsrv.log" || { kill $DEV_PID; fail "second endpoint is not in dev mode: $(cat "$WORK/devsrv.log")"; }
+for variant in "../escape-4" "..%2Fescape-5" "a/../../escape-6" "a%2F..%2F..%2Fescape-7"; do
+  code=$(curl -s --path-as-is -X PUT --data-binary 'PWNED' -o "$WORK/trav.out" -w '%{http_code}' "http://127.0.0.1:$DEVPORT/s3e2e-keys/$variant")
+  if [ "$code" != 400 ] || ! grep -q InvalidArgument "$WORK/trav.out"; then
+    kill $DEV_PID; fail "unsigned traversal key '$variant' not refused with 400 InvalidArgument: HTTP $code $(cat "$WORK/trav.out")"
+  fi
+done
+kill $DEV_PID; wait $DEV_PID 2>/dev/null || true
+for n in 1 3 4 5 6 7; do
+  [ ! -e "$WORK/escape-$n" ] || fail "path traversal wrote $WORK/escape-$n"
+done
+[ "$($PSQL -c "SELECT count(*) FROM objects WHERE key LIKE '%..%'")" = 0 ] || fail "a traversal key reached the catalog"
+$AWS s3api delete-object --bucket s3e2e-keys --key dir/sub/file.txt >/dev/null || fail "delete nested key"
+echo "nested keys stage as obj-*; '../' keys refused before touching disk or catalog"
+
 say "list-buckets"
 $AWS s3api list-buckets --query "Buckets[].Name" --output text | grep -qw vtl || fail "bucket not listed"
 
