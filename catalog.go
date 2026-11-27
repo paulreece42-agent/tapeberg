@@ -536,11 +536,13 @@ func poolEC(db *sql.DB, pool string) (*ECConfig, error) {
 
 // setPoolEC sets (or clears, k=0) a pool's EC policy.
 func setPoolEC(db *sql.DB, pool string, k, m int) error {
+	var res sql.Result
+	var err error
 	if k == 0 {
-		_, err := db.Exec(`UPDATE tape_pools SET ec_k = NULL, ec_m = NULL WHERE name = $1`, pool)
-		return err
+		res, err = db.Exec(`UPDATE tape_pools SET ec_k = NULL, ec_m = NULL WHERE name = $1`, pool)
+	} else {
+		res, err = db.Exec(`UPDATE tape_pools SET ec_k = $2, ec_m = $3 WHERE name = $1`, pool, k, m)
 	}
-	res, err := db.Exec(`UPDATE tape_pools SET ec_k = $2, ec_m = $3 WHERE name = $1`, pool, k, m)
 	if err != nil {
 		return err
 	}

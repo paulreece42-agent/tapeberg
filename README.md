@@ -48,10 +48,15 @@ tapeberg rm file.tar              # soft delete (tape bytes reclaimed by repack)
 tapeberg status
 tapeberg ack TB0003L5             # manual changer: "tape is in the drive"
 tapeberg tape add TB0004L5 1500GB # register media into $TAPEBERG_POOL
-tapeberg pool ls                  # pools, tape counts, EC policy
+tapeberg pool ls                  # pools: tapes by state, buckets, usage, EC policy
+tapeberg pool add offsite         # new pool (give it tapes and a worker)
+tapeberg bucket ls                # buckets and the pool each is bound to
+tapeberg bucket create photos --pool offsite
+tapeberg bucket set-pool photos default   # new archives go to default's tapes
 ```
 
-The CLI works on its own bucket, `tapeberg`; other buckets are S3-only.
+The CLI's ingest/get/rm work on its own bucket, `tapeberg`; other
+buckets' objects are S3-only.
 
 ## Pools, buckets and drives
 
@@ -62,7 +67,8 @@ one of them.
 
 - A **pool** is a set of tapes (plus its erasure-coding policy).
 - A **bucket** is bound to one pool: its new archives go to that
-  pool's tapes. CreateBucket binds the endpoint's `TAPEBERG_POOL`.
+  pool's tapes. CreateBucket binds the endpoint's `TAPEBERG_POOL`;
+  `bucket create --pool` / `bucket set-pool` choose explicitly.
 - A **tape** belongs to one pool (`tape add` uses `TAPEBERG_POOL`).
 - A **worker** serves exactly one pool with exactly one library — the
   `TAPEBERG_POOL`, `TAPEBERG_DRIVE(S)` and changer in its config. A
