@@ -292,7 +292,7 @@ func restoreOne(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
 	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
 		return err
 	}
-	dst := filepath.Join(cfg.BufferDir, req.Key)
+	dst := restorePath(cfg, req.ObjectID)
 	// Seek by the recorded PHYSICAL position — archive_id counts only
 	// our files, the tape may hold more.
 	sha, rerr := readTapeFile(cfg.Drive, tf.PhysicalFile, dst)
@@ -331,7 +331,7 @@ func restoreOneEC(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq, ec *ECCo
 	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
 		return err
 	}
-	dst := filepath.Join(cfg.BufferDir, req.Key)
+	dst := restorePath(cfg, req.ObjectID)
 	// Single EC object: one stripe across k+m tapes. The archive request
 	// carried part_number 1 (no parts table rows — the multipart
 	// default), and the placements live under that part.
@@ -901,4 +901,10 @@ func restoreMultipartEC(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq, ec
 	fmt.Printf("worker: restored %s (%d RAIT %d+%d parts, pinned %d days)\n",
 		req.Key, len(parts), ec.K, ec.M, req.PinDays)
 	return nil
+}
+
+// restorePath is where a restored copy lands: named by object id, never
+// by key (keys are client input — see checkObjectKey).
+func restorePath(cfg Config, objectID int64) string {
+	return filepath.Join(cfg.BufferDir, fmt.Sprintf("restore-%d", objectID))
 }

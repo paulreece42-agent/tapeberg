@@ -190,9 +190,19 @@ func ingestStream(db *sql.DB, cfg Config, bucket, key string, r io.Reader, pool 
 	if err := os.MkdirAll(cfg.BufferDir, 0o755); err != nil {
 		return nil, err
 	}
-	dst := filepath.Join(cfg.BufferDir, key)
-	out, err := os.Create(dst)
+	// Staged under a name tapeberg picks, never the key: S3 keys arrive
+	// decoded (%2F → '/') and never cleaned of '..' ('../../etc/x'
+	// escaped the buffer, as root), and two buckets may hold the same key.
+	// O_EXCL via CreateTemp also means a duplicate PUT can't truncate a
+	// staged copy before insertObject refuses it.
+	out, err := os.CreateTemp(cfg.BufferDir, "obj-*")
 	if err != nil {
+		return nil, err
+	}
+	dst := out.Name()
+	if err := out.Chmod(0o644); err != nil { // as os.Create gave under umask 022
+		out.Close()
+		os.Remove(dst)
 		return nil, err
 	}
 	h := sha256.New()
