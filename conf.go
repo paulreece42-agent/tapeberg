@@ -14,8 +14,9 @@
 // so a conf file never shadows an explicit env var. Precedence is
 // implemented by only exporting keys the env does not already define.
 //
-// File lookup: $TAPEBERG_CONF if set (must exist), then /etc/tapeberg.conf
-// and ~/.config/tapeberg/conf (all present files load, in that order).
+// File lookup: $TAPEBERG_CONF if set (replaces the defaults), else
+// /etc/tapeberg.conf then ~/.config/tapeberg.conf (all present files
+// load, in that order; a missing file is skipped, the explicit one too).
 // Values may be single- or double-quoted; blank lines and #-comments
 // ignored. Files are meant to be chmod 600 — they carry credentials.
 package main
