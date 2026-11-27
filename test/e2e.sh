@@ -107,6 +107,32 @@ for i in 1 4 5; do
 done
 echo "3 restores byte-identical to sources"
 
+say "restore pool follows tape placement, not the caller's TAPEBERG_POOL"
+# A pool name no worker serves anywhere: even if this regresses, the
+# request can never reach a real rig's worker (which would ask a human
+# to load a virtual tape into a physical drive — the 0004/0005 incident).
+MIS=e2e-misroute
+TAPEBERG_POOL=$MIS "$BIN" restore e2e-file3 1
+rp=$($PSQL -c "SELECT r.pool FROM retrieve_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='e2e-file3' AND r.state='pending'")
+[ "$rp" = vtl ] || fail "restore with TAPEBERG_POOL=$MIS queued in pool '$rp', want vtl (where e2e-file3's tape is)"
+"$BIN" worker
+s=$($PSQL -c "SELECT r.state FROM retrieve_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='e2e-file3' ORDER BY r.id DESC LIMIT 1")
+[ "$s" = restored ] || fail "placement-routed restore of e2e-file3 state=$s"
+"$BIN" get e2e-file3 > "$WORK/out3"
+cmp "$WORK/src3" "$WORK/out3" || fail "e2e-file3 differs from source bytes"
+echo "restore queued by placement (vtl) despite TAPEBERG_POOL=$MIS; byte-identical"
+
+say "worker re-routes a restore already queued in the wrong pool"
+$PSQL -c "INSERT INTO retrieve_requests (object_id, pin_days, pool) SELECT id, 1, '$MIS' FROM objects WHERE key='e2e-file3'" >/dev/null
+out=$(TAPEBERG_POOL=$MIS "$BIN" worker)
+echo "$out"
+echo "$out" | grep "re-routed $MIS -> vtl" >/dev/null || fail "the $MIS worker did not re-route the misqueued restore"
+rp=$($PSQL -c "SELECT r.pool FROM retrieve_requests r JOIN objects o ON o.id=r.object_id WHERE o.key='e2e-file3' AND r.state='pending'")
+[ "$rp" = vtl ] || fail "re-routed restore sits in pool '$rp', want vtl"
+# Leave nothing pending for later passes.
+$PSQL -c "UPDATE retrieve_requests SET state='cancelled' WHERE state='pending' AND object_id=(SELECT id FROM objects WHERE key='e2e-file3')" >/dev/null
+echo "misqueued restore handed to the pool that holds its tape"
+
 say "worker pass 3: pin expiry sweep"
 $PSQL -c "UPDATE retrieve_requests SET expires_at = now() - interval '1 hour' WHERE object_id=(SELECT id FROM objects WHERE key='e2e-file1')" >/dev/null
 "$BIN" worker
