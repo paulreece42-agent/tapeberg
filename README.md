@@ -47,7 +47,8 @@ tapeberg get file.tar > out       # errors InvalidObjectState until restored
 tapeberg rm file.tar              # soft delete (tape bytes reclaimed by repack)
 tapeberg status
 tapeberg ack TB0003L5             # manual changer: "tape is in the drive"
-tapeberg tape add TB0004L5 1500GB # register media into $TAPEBERG_POOL
+tapeberg tape add TB0004L5 1500GB # register media into $TAPEBERG_POOL (or --pool P)
+tapeberg tape ls                  # tapes: pool, state, live/dead bytes
 tapeberg pool ls                  # pools: tapes by state, buckets, usage, EC policy
 tapeberg pool add offsite         # new pool (give it tapes and a worker)
 tapeberg bucket ls                # buckets and the pool each is bound to
@@ -69,7 +70,8 @@ one of them.
 - A **bucket** is bound to one pool: its new archives go to that
   pool's tapes. CreateBucket binds the endpoint's `TAPEBERG_POOL`;
   `bucket create --pool` / `bucket set-pool` choose explicitly.
-- A **tape** belongs to one pool (`tape add` uses `TAPEBERG_POOL`).
+- A **tape** belongs to one pool (`tape add` uses `TAPEBERG_POOL` or
+  `--pool`; `tape mv … --to` moves tapes between pools).
 - A **worker** serves exactly one pool with exactly one library — the
   `TAPEBERG_POOL`, `TAPEBERG_DRIVE(S)` and changer in its config. A
   node with two libraries runs two workers, each with its own conf
@@ -136,7 +138,8 @@ file is read from the source tape (checksum-verified against the
 catalog), re-archived to another tape in the pool, and the emptied
 tape is marked `retired`. A read or checksum failure aborts that
 tape's repack and leaves it untouched — a suspect tape is never
-freed. Erase a retired tape and `tape add` it to reuse the media.
+freed. Erase a retired tape and `tapeberg tape reuse` it to put the media back
+in service.
 
 ## S3 (awscli)
 

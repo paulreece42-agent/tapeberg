@@ -473,7 +473,7 @@ func expirySweep(db *sql.DB, pool string) error {
 // TAPEBERG_REPACK_THRESHOLD (default 50%): every live file is read
 // from the source tape (sha-verified against the catalog), written to
 // another tape in the pool, and its placement row moved; the emptied
-// source is marked 'retired' (pickTape ignores it — erase and re-add
+// source is marked 'retired' (pickTape ignores it — erase and 'tape reuse'
 // to reuse the media). Any read/verify failure aborts that tape's
 // repack and leaves it untouched — a suspect tape is never freed.
 func repackPass(db *sql.DB, cfg Config, ch Changer) error {
