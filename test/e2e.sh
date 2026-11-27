@@ -16,10 +16,11 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d /tmp/tapeberg-e2e.XXXXXX)
 BIN="$WORK/tapeberg"
-trap 'rm -rf "$WORK"' EXIT
+trap 'rc=$?; rm -rf "$WORK"; scratch_catalog_exit $rc' EXIT
 
 say() { printf '\n=== %s ===\n' "$*"; }
 fail() { printf '\nE2E FAIL: %s\n' "$*" >&2; exit 1; }
+. "$ROOT/test/scratch-catalog.sh"
 
 say "building tapeberg"
 cd "$ROOT"
@@ -45,6 +46,9 @@ export TAPEBERG_CHANGER_DEV="$CHANGER_DEV"
 export TAPEBERG_POOL=vtl
 export TAPEBERG_BUFFER="$WORK/buffer"
 mkdir -p "$TAPEBERG_BUFFER"
+
+say "isolating the catalog (scratch schema — the real catalog's rows are never touched)"
+scratch_catalog_up
 PSQL="psql $TAPEBERG_DB_URL -tAq"
 
 say "blanking VTL media (erase prior test data — capacity persists otherwise)"
