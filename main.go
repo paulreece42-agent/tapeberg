@@ -224,10 +224,11 @@ func cmdRestore(cfg Config, key string, days int) error {
 		fmt.Printf("%s is already on disk (restored); no new request needed\n", key)
 		return nil
 	}
-	if err := createRetrieveRequest(db, obj.ID, days, cfg.Pool); err != nil {
+	pool, err := createRetrieveRequest(db, obj.ID, days, cfg.Pool)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("restore queued for %s (pin %d days) — run 'tapeberg worker' to drain it\n", key, days)
+	fmt.Printf("restore queued for %s in pool %s (pin %d days) — the %s worker drains it\n", key, pool, days, pool)
 	return nil
 }
 

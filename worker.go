@@ -7,6 +7,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -239,7 +240,28 @@ func drainRestores(db *sql.DB, cfg Config, ch Changer) error {
 		if len(reqs) == 0 {
 			return nil
 		}
-		if err := restoreOne(db, cfg, ch, &reqs[0]); err != nil {
+		req := &reqs[0]
+		// Never load a tape this library doesn't hold. Requests queued
+		// before restores resolved their pool from placement can sit in
+		// the wrong pool; hand them to the pool that owns the tapes.
+		pp, err := placementPool(db, req.ObjectID)
+		if err != nil {
+			if !errors.Is(err, errSpansPools) {
+				return err // transient: leave the request pending for the next run
+			}
+			if ferr := failRetrieve(db, req.ID, err.Error()); ferr != nil {
+				return ferr // never spin on a request we couldn't fail
+			}
+			continue
+		}
+		if pp != "" && pp != cfg.Pool {
+			if err := setRetrievePool(db, req.ID, pp); err != nil {
+				return err
+			}
+			fmt.Printf("worker: restore of %s re-routed %s -> %s (its tapes are in pool %s)\n", req.Key, cfg.Pool, pp, pp)
+			continue
+		}
+		if err := restoreOne(db, cfg, ch, req); err != nil {
 			return err
 		}
 	}

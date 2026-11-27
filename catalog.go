@@ -677,8 +677,72 @@ func objectToStandard(db *sql.DB, objectID int64, path string) error {
 
 // ---- restore queue ----
 
-func createRetrieveRequest(db *sql.DB, objectID int64, days int, pool string) error {
-	_, err := db.Exec(`INSERT INTO retrieve_requests (object_id, pin_days, pool) VALUES ($1, $2, $3)`, objectID, days, pool)
+// createRetrieveRequest queues a restore and returns the pool it was
+// queued in. The pool comes from where the object's bytes actually are
+// (placementPool) — only the worker serving that pool has a library
+// holding those tapes. The caller's pool (the bucket's binding for S3,
+// TAPEBERG_POOL for the CLI) is just the fallback for an object with
+// nothing on tape yet. Trusting the caller's pool sent restores to the
+// wrong worker: a bucket rebound after archiving, or a CLI ingest made
+// with a different TAPEBERG_POOL, queued the request in a pool whose
+// library has never seen the tape.
+func createRetrieveRequest(db *sql.DB, objectID int64, days int, fallbackPool string) (string, error) {
+	pool, err := placementPool(db, objectID)
+	if err != nil {
+		return "", err
+	}
+	if pool == "" {
+		pool = fallbackPool
+	}
+	_, err = db.Exec(`INSERT INTO retrieve_requests (object_id, pin_days, pool) VALUES ($1, $2, $3)`, objectID, days, pool)
+	return pool, err
+}
+
+// errSpansPools marks the one permanent placementPool failure (as
+// opposed to a transient DB error, which must not fail a restore).
+var errSpansPools = errors.New("a restore is served by one library, but the object spans several pools")
+
+// placementPool reports the pool of the tapes holding an object's bytes
+// (every part and shard), or "" when nothing of it is on tape yet. An
+// object spread over several pools is an error: a restore is drained by
+// one worker, and one worker drives one library.
+func placementPool(db *sql.DB, objectID int64) (string, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT p.name
+		FROM tape_files tf
+		JOIN tapes t ON t.id = tf.tape_id
+		JOIN tape_pools p ON p.id = t.pool_id
+		WHERE tf.object_id = $1
+		ORDER BY 1`, objectID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var pools []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return "", err
+		}
+		pools = append(pools, p)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	switch len(pools) {
+	case 0:
+		return "", nil
+	case 1:
+		return pools[0], nil
+	default:
+		return "", fmt.Errorf("object %d has tape placements in pools %v: %w", objectID, pools, errSpansPools)
+	}
+}
+
+// setRetrievePool moves a pending restore to another pool's queue.
+func setRetrievePool(db *sql.DB, reqID int64, pool string) error {
+	_, err := db.Exec(`UPDATE retrieve_requests SET pool = $2, updated_at = now()
+		WHERE id = $1 AND state = 'pending'`, reqID, pool)
 	return err
 }
 

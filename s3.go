@@ -714,12 +714,13 @@ func (s *s3srv) restoreObject(w http.ResponseWriter, r *http.Request, bucket, ke
 	if found {
 		return errS3("RestoreAlreadyInProgress", "object restore is already in progress", http.StatusConflict)
 	}
-	// Restore queues in the bucket's bound pool.
+	// The bucket's bound pool is only the fallback: a restore queues
+	// where the object's tapes are (createRetrieveRequest).
 	pool, err := bucketPool(s.db, bucket)
 	if err != nil {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
-	if err := createRetrieveRequest(s.db, obj.ID, days, pool); err != nil {
+	if _, err := createRetrieveRequest(s.db, obj.ID, days, pool); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusAccepted)
