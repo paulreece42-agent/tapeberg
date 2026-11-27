@@ -190,4 +190,47 @@ if "$BIN" get e2e-rm-test >/dev/null 2>"$WORK/rmerr" 2>&1; then
 fi
 [ "$($PSQL -c "SELECT count(*) FROM archive_requests WHERE state='pending' AND object_id IN (SELECT id FROM objects WHERE key='e2e-rm-test')")" = 0 ] || fail "rm must cancel pending archive requests"
 
+say "pool + bucket admin CLI"
+# refuses() runs a command that must FAIL; its stderr is shown for the log.
+refuses() { if "$@" 2>"$WORK/refusal"; then fail "should have been refused: $*"; fi; echo "  refused: $(cat "$WORK/refusal")"; }
+poolrow() { "$BIN" pool ls | awk -F'\t' -v p="$1" '$1==p'; }
+bucketrow() { "$BIN" bucket ls | awk -F'\t' -v b="$1" '$1==b'; }
+
+"$BIN" pool add e2e-pool --description "e2e scratch pool" >/dev/null || fail "pool add failed"
+poolrow e2e-pool | grep '0 tape(s).*0 bucket(s).*single copy' >/dev/null || fail "pool ls row for e2e-pool: '$(poolrow e2e-pool)'"
+refuses "$BIN" pool add e2e-pool
+refuses "$BIN" pool add Bad_Name
+refuses "$BIN" pool set e2e-nonexistent --no-ec      # used to report success
+refuses "$BIN" bucket create e2e-bkt --pool e2e-nonexistent
+refuses "$BIN" bucket create e2e-bkt                 # --pool is mandatory
+refuses "$BIN" bucket create E2E_BAD --pool e2e-pool
+"$BIN" bucket create e2e-bkt --pool e2e-pool >/dev/null || fail "bucket create failed"
+[ "$($PSQL -c "SELECT pool FROM buckets WHERE name='e2e-bkt'")" = e2e-pool ] || fail "e2e-bkt not bound to e2e-pool"
+refuses "$BIN" bucket create e2e-bkt --pool e2e-pool
+poolrow e2e-pool | grep '1 bucket(s)' >/dev/null || fail "pool ls should count e2e-bkt: '$(poolrow e2e-pool)'"
+refuses "$BIN" pool rm e2e-pool                      # a bucket is bound to it
+refuses "$BIN" pool rm vtl                           # it has tapes
+refuses "$BIN" pool rm default
+refuses "$BIN" bucket set-pool e2e-bkt e2e-nonexistent
+"$BIN" bucket set-pool e2e-bkt vtl >/dev/null || fail "bucket set-pool failed"
+bucketrow e2e-bkt | grep 'pool vtl' >/dev/null || fail "bucket ls after set-pool: '$(bucketrow e2e-bkt)'"
+"$BIN" pool rm e2e-pool >/dev/null || fail "pool rm of the now-unused pool failed"
+[ "$($PSQL -c "SELECT count(*) FROM tape_pools WHERE name='e2e-pool'")" = 0 ] || fail "e2e-pool still exists"
+# A bucket bound to a pool name that doesn't exist (free-text column) is flagged.
+$PSQL -c "UPDATE buckets SET pool='e2e-ghost' WHERE name='e2e-bkt'" >/dev/null
+bucketrow e2e-bkt | grep 'NO SUCH POOL' >/dev/null || fail "dangling pool binding not flagged: '$(bucketrow e2e-bkt)'"
+$PSQL -c "UPDATE buckets SET pool='vtl' WHERE name='e2e-bkt'" >/dev/null
+# bucket rm refuses live objects AND tombstones (rows are kept forever).
+$PSQL -c "INSERT INTO objects (bucket_id, key, size_bytes) SELECT id, 'e2e-bkt-obj', 1 FROM buckets WHERE name='e2e-bkt'" >/dev/null
+refuses "$BIN" bucket rm e2e-bkt
+$PSQL -c "UPDATE objects SET deleted_at = now() WHERE key='e2e-bkt-obj'" >/dev/null
+refuses "$BIN" bucket rm e2e-bkt
+$PSQL -c "DELETE FROM objects WHERE key='e2e-bkt-obj'" >/dev/null
+refuses "$BIN" bucket rm tapeberg                    # the CLI ingest bucket
+"$BIN" bucket rm e2e-bkt >/dev/null || fail "bucket rm of an empty bucket failed"
+[ "$($PSQL -c "SELECT count(*) FROM buckets WHERE name='e2e-bkt'")" = 0 ] || fail "e2e-bkt still exists"
+"$BIN" pool ls
+"$BIN" bucket ls
+echo "pool/bucket admin: create, bind, rebind, refuse-when-in-use, remove"
+
 printf '\nE2E PASS — all basic functions verified\n'

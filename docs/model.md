@@ -33,11 +33,11 @@ belongs together*; each node's config says *what this box can reach*.
 
 | Link | Stored in | Set by | How to change it today |
 |---|---|---|---|
-| bucket → pool | `buckets.pool` | S3 **CreateBucket**: the bucket binds to the creating endpoint's `TAPEBERG_POOL`. The CLI's own bucket, `tapeberg`, is seeded into `default`. | No CLI yet — SQL only (see caveats before doing it) |
+| bucket → pool | `buckets.pool` | S3 **CreateBucket**: the bucket binds to the creating endpoint's `TAPEBERG_POOL`. `tapeberg bucket create <name> --pool P` binds explicitly. The CLI's own bucket, `tapeberg`, is seeded into `default`. | `tapeberg bucket set-pool <bucket> <pool>` |
 | tape → pool | `tapes.pool_id` | `tapeberg tape add` puts the tape in the invoking environment's `TAPEBERG_POOL` | No CLI yet — SQL only |
 | pool → EC policy | `tape_pools.ec_k/ec_m` | `tapeberg pool set <pool> --ec-k K --ec-m M` / `--no-ec` | CLI |
 | pool → drives/library | node config | a worker process serves exactly the pool in its `TAPEBERG_POOL`, using its `TAPEBERG_DRIVE(S)` and changer | edit that process's config |
-| pool itself | `tape_pools` | seed (`default`) and migration 0004 (`vtl`) | No CLI yet — SQL only |
+| pool itself | `tape_pools` | seed (`default`), migration 0004 (`vtl`), `tapeberg pool add <name>` | `tapeberg pool rm <name>` (only when unused) |
 
 ## The rules the code follows
 
@@ -49,10 +49,11 @@ belongs together*; each node's config says *what this box can reach*.
   PutObject and multipart parts use the **bucket's** pool. CLI
   `tapeberg ingest` uses the shell's **`TAPEBERG_POOL`** — not the
   `tapeberg` bucket's pool (see caveats).
-- **Restore requests are stamped the same way.** S3 RestoreObject uses
-  the bucket's current pool; CLI `tapeberg restore` uses
-  `TAPEBERG_POOL`. Neither yet looks at where the object physically
-  is (see caveats).
+- **Restore requests go where the object's tapes are.** The pool is
+  resolved from the object's tape placement; the bucket's pool (S3) or
+  `TAPEBERG_POOL` (CLI) is only the fallback for an object not yet on
+  tape. A worker that finds a request whose tapes belong to another
+  pool hands it to that pool instead of loading anything.
 - **Every tape in a pool must be reachable by the library serving
   it.** Robot mode: the tape sits in that changer's slots (Tapeberg
   finds it by barcode with `mtx status`). Manual mode: a human can
@@ -81,18 +82,16 @@ belongs together*; each node's config says *what this box can reach*.
 
 ### Add a pool
 
-There is no `pool add` yet:
-
 ```sh
-psql "$TAPEBERG_DB_URL" -c "INSERT INTO tape_pools (name, description) VALUES ('offsite', 'second copy set')"
+tapeberg pool add offsite --description "second copy set"
 TAPEBERG_POOL=offsite tapeberg tape add TB0101L5 1500GB    # repeat per tape
+tapeberg bucket create photos-offsite --pool offsite
 tapeberg pool ls
 ```
 
-Then give the pool a worker (next recipe), and either bind a bucket to
-it (create the bucket through an endpoint running with
-`TAPEBERG_POOL=offsite`) or ingest into it from the CLI with
-`TAPEBERG_POOL=offsite`.
+Then give the pool a worker (next recipe). CLI ingests go to the
+shell's `TAPEBERG_POOL`, so `TAPEBERG_POOL=offsite tapeberg ingest …`
+also archives into it.
 
 ### Two libraries on one node
 
@@ -138,29 +137,26 @@ enough for both pools (see the rules above).
 
 ### Bind a bucket to a different pool
 
-New bucket: create it through an S3 endpoint whose `TAPEBERG_POOL` is
-the target pool. Existing bucket: SQL only
-(`UPDATE buckets SET pool = 'offsite' WHERE name = 'photos'`). That
-changes where **new** archives go; objects already on tape stay on the
-old pool's tapes. **Don't rebind a bucket that already holds archived
-objects yet** — see the restore caveat below.
+```sh
+tapeberg bucket set-pool photos offsite
+```
+
+That changes where **new** archives go. Objects already on tape stay on
+the old pool's tapes, and restores still find them there (they follow
+placement). Archives already queued keep the pool they were queued
+for; the command says how many. `tapeberg bucket ls` shows every
+binding and flags one that names a pool that doesn't exist.
 
 ## Caveats (known gaps)
 
-- **Restores trust the request's pool, not the object's placement.**
-  A restore is queued in the bucket's current pool (S3) or the shell's
-  `TAPEBERG_POOL` (CLI). If the object's tapes are in a *different*
-  pool, the wrong worker picks the request up and tries to load a tape
-  its library doesn't hold. This happens to objects CLI-ingested with
-  a non-default `TAPEBERG_POOL` (they live in the `tapeberg` bucket,
-  bound to `default`) and to buckets rebound after archiving.
 - **CLI ingest ignores the bucket's pool**; it uses `TAPEBERG_POOL`, so
-  the `tapeberg` bucket can end up spanning several pools.
-- **Pool, bucket and tape management is SQL-only** beyond `pool ls`,
-  `pool set` and `tape add`: no pool create/remove, no bucket
-  create/list/rebind/delete from the CLI, no tape list/move/state
-  change. `tapeberg pool set <unknown> --no-ec` reports success
-  without changing anything.
+  the `tapeberg` bucket can end up spanning several pools. (Restores
+  cope; the bucket's binding is just misleading.)
+- **Tape management is SQL-only** beyond `tape add`: no tape
+  list/move/state change.
+- **`bucket rm` only removes buckets that never held objects.** Deleted
+  objects keep their catalog row as a tombstone, so a bucket that held
+  anything can't be dropped yet.
 - **Retired tapes can't be re-added.** `tape add` refuses an existing
   barcode, so "erase and `tape add` again" fails with *already
   registered*. Until there is a CLI for it, re-activate by SQL — only

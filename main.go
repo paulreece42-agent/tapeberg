@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,8 +32,14 @@ usage:
   tapeberg get <key>                 cat a restored object to stdout
   tapeberg rm <key>                  soft-delete an object (tape bytes reclaimed at repack)
   tapeberg tape add <barcode> [capacity]  register a tape in the catalog (capacity like 1500GB; default 1500GB, LTO-5)
-  tapeberg pool ls                   list pools and their erasure-coding policy
+  tapeberg pool ls                   list pools: tapes by state, bound buckets, usage, EC policy
+  tapeberg pool add <name> [--description X]   create a pool (then run a worker with TAPEBERG_POOL=<name>)
+  tapeberg pool rm <name>            remove an unused pool (no tapes, buckets or queued work)
   tapeberg pool set <name> --ec-k 2 --ec-m 1   RAIT stripe per archive (or --no-ec)
+  tapeberg bucket ls                 list buckets: bound pool, owner, object counts
+  tapeberg bucket create <name> --pool P [--owner UID]   create a bucket bound to pool P
+  tapeberg bucket set-pool <name> <pool>   rebind: new archives go to <pool>; existing objects stay put
+  tapeberg bucket rm <name>          remove a bucket that never held objects
   tapeberg user <subcommand>         manage S3 users (add/rm/ls/info/suspend/unsuspend; --full-name, --email, --admin)
   tapeberg key <subcommand>         manage S3 keys (add --uid, rm --access-key; users may hold several)
   tapeberg status                    catalog + queue summary
@@ -125,6 +132,9 @@ func run(args []string) error {
 
 	case "pool":
 		return cmdPool(cfg, rest)
+
+	case "bucket":
+		return cmdBucket(cfg, rest)
 
 	case "status":
 		return cmdStatus(cfg)
@@ -622,10 +632,11 @@ func cmdRm(cfg Config, key string) error {
 	return nil
 }
 
-// cmdPool manages pool-level policy: the EC/RAIT stripe shape.
+// cmdPool manages pools: create/remove, and the EC/RAIT stripe shape.
 func cmdPool(cfg Config, args []string) error {
+	const usage = "usage: tapeberg pool ls | add <name> [--description X] | rm <name> | set <name> [--ec-k N --ec-m M | --no-ec]"
 	if len(args) < 1 {
-		return fmt.Errorf("usage: tapeberg pool ls | set <name> [--ec-k N --ec-m M | --no-ec]")
+		return errors.New(usage)
 	}
 	db, err := openDB(cfg.DBURL)
 	if err != nil {
@@ -634,27 +645,41 @@ func cmdPool(cfg Config, args []string) error {
 	defer db.Close()
 	switch args[0] {
 	case "ls":
-		rows, err := db.Query(`
-			SELECT p.name, COALESCE(p.ec_k, 0), COALESCE(p.ec_m, 0),
-			       (SELECT count(*) FROM tapes t WHERE t.pool_id = p.id)
-			FROM tape_pools p ORDER BY p.name`)
+		pools, err := listPools(db)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var name string
-			var k, m, tapes int
-			if err := rows.Scan(&name, &k, &m, &tapes); err != nil {
-				return err
-			}
+		for _, p := range pools {
 			ec := "single copy"
-			if k > 0 {
-				ec = fmt.Sprintf("RAIT %d+%d (loses %d, survives %d)", k, m, m, m)
+			if p.ECK > 0 {
+				ec = fmt.Sprintf("RAIT %d+%d (survives %d tape loss(es))", p.ECK, p.ECM, p.ECM)
 			}
-			fmt.Printf("%s\t%d tape(s)\t%s\n", name, tapes, ec)
+			fmt.Printf("%s\t%d tape(s) (%d active, %d full, %d retired/lost)\t%d bucket(s)\t%s written of %s\t%s\n",
+				p.Name, p.Tapes, p.Active, p.Full, p.Gone, p.Buckets,
+				humanBytes(p.WrittenBytes), humanBytes(p.CapacityBytes), ec)
 		}
-		return rows.Err()
+		return nil
+	case "add":
+		if len(args) < 2 || strings.HasPrefix(args[1], "--") {
+			return fmt.Errorf("usage: tapeberg pool add <name> [--description X]")
+		}
+		desc, _ := flagValue(args, "--description")
+		if err := addPool(db, args[1], desc); err != nil {
+			return err
+		}
+		fmt.Printf("pool %s created (single copy; 'tapeberg pool set %s --ec-k N --ec-m M' for RAIT)\n", args[1], args[1])
+		fmt.Printf("next: register its tapes, bind buckets ('tapeberg bucket create <name> --pool %s'),\n", args[1])
+		fmt.Printf("      and run a worker with TAPEBERG_POOL=%s on the node whose library holds those tapes\n", args[1])
+		return nil
+	case "rm":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: tapeberg pool rm <name>")
+		}
+		if err := removePool(db, args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("pool %s removed\n", args[1])
+		return nil
 	case "set":
 		if len(args) < 2 {
 			return fmt.Errorf("usage: tapeberg pool set <name> [--ec-k N --ec-m M | --no-ec]")
@@ -685,6 +710,78 @@ func cmdPool(cfg Config, args []string) error {
 		fmt.Println("note: the policy freezes onto each object at archive time; existing objects keep their shape")
 		return nil
 	default:
-		return fmt.Errorf("unknown pool subcommand %q (have: ls set)", args[0])
+		return fmt.Errorf("unknown pool subcommand %q (have: ls add rm set)", args[0])
+	}
+}
+
+// cmdBucket manages buckets and their pool binding from the CLI.
+func cmdBucket(cfg Config, args []string) error {
+	const usage = "usage: tapeberg bucket ls | create <name> --pool P [--owner UID] | set-pool <name> <pool> | rm <name>"
+	if len(args) < 1 {
+		return errors.New(usage)
+	}
+	db, err := openDB(cfg.DBURL)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	switch args[0] {
+	case "ls":
+		buckets, err := listAllBuckets(db)
+		if err != nil {
+			return err
+		}
+		for _, b := range buckets {
+			pool := b.Pool
+			if b.PoolMissing {
+				pool += " (NO SUCH POOL — 'tapeberg bucket set-pool')"
+			}
+			owner := b.Owner
+			if owner == "" {
+				owner = "(system)"
+			}
+			fmt.Printf("%s\tpool %s\towner %s\t%d object(s), %s\t%d deleted\n",
+				b.Name, pool, owner, b.Objects, humanBytes(b.Bytes), b.Deleted)
+		}
+		return nil
+	case "create":
+		if len(args) < 2 || strings.HasPrefix(args[1], "--") {
+			return fmt.Errorf("usage: tapeberg bucket create <name> --pool P [--owner UID]")
+		}
+		pool, ok := flagValue(args, "--pool")
+		if !ok || pool == "" {
+			return fmt.Errorf("bucket create needs --pool (S3 CreateBucket binds to the endpoint's TAPEBERG_POOL; the CLI makes you choose)")
+		}
+		owner, _ := flagValue(args, "--owner")
+		if err := createBucketCLI(db, args[1], pool, owner); err != nil {
+			return err
+		}
+		fmt.Printf("bucket %s created, bound to pool %s\n", args[1], pool)
+		return nil
+	case "set-pool":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: tapeberg bucket set-pool <name> <pool>")
+		}
+		queued, err := setBucketPool(db, args[1], args[2])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("bucket %s now bound to pool %s: new archives go to its tapes\n", args[1], args[2])
+		fmt.Println("objects already on tape stay where they are (restores follow their tapes)")
+		if queued > 0 {
+			fmt.Printf("note: %d archive(s) already queued for this bucket keep their original pool\n", queued)
+		}
+		return nil
+	case "rm":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: tapeberg bucket rm <name>")
+		}
+		if err := removeBucket(db, args[1]); err != nil {
+			return err
+		}
+		fmt.Printf("bucket %s removed\n", args[1])
+		return nil
+	default:
+		return fmt.Errorf("unknown bucket subcommand %q (have: ls create set-pool rm)", args[0])
 	}
 }
