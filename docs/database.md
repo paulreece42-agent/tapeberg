@@ -28,6 +28,14 @@ bucket, and the 16 mhvtl data tapes + 1 cleaning tape in pool `vtl`.
 A production catalog wants the `default` pool and `tapeberg` bucket but
 not the VTL tapes.
 
+**schema.sql** is the whole schema as one file, generated from the
+migrations by `scripts/gen-schema.sh` — handy for reading the model in
+one place or bootstrapping tools that can't apply migrations one by
+one. The migrations remain canonical; `test/e2e.sh` fails if the
+snapshot drifts. Apply it to an empty database/schema with
+`psql -f schema.sql` (search_path decides where the tables land), then
+optionally the seed.
+
 Migrations are plain SQL files, `db/migrations/NNNN_name.sql`. There is
 no migration **runner** — apply new ones by hand, in order, after
 pulling.

@@ -49,6 +49,30 @@ mkdir -p "$TAPEBERG_BUFFER"
 
 say "isolating the catalog (scratch schema — the real catalog's rows are never touched)"
 scratch_catalog_up
+
+say "schema.sql matches db/migrations"
+command -v pg_dump >/dev/null || fail "pg_dump not installed"
+CHK_SCHEMA=tapeberg_e2e_schemachk
+PGOPTIONS= psql "$TAPEBERG_DB_URL" -Xq -c "DROP SCHEMA IF EXISTS $CHK_SCHEMA CASCADE" >/dev/null
+PGOPTIONS= psql "$TAPEBERG_DB_URL" -Xq -c "CREATE SCHEMA $CHK_SCHEMA" >/dev/null \
+  || fail "schema-check: cannot create $CHK_SCHEMA"
+PGOPTIONS="-c search_path=$CHK_SCHEMA" psql "$TAPEBERG_DB_URL" -Xq -v ON_ERROR_STOP=1 -f "$ROOT/schema.sql" >/dev/null \
+  || fail "schema.sql does not apply"
+norm_dump() {
+  pg_dump "$TAPEBERG_DB_URL" --schema-only --no-owner --no-privileges -n "$1" \
+    | sed -e "s/$1\.//g" -e "s/; Schema: $1;/; Schema: -;/g" \
+    | grep -v "^SELECT pg_catalog.set_config" | grep -v "^-- Dumped" \
+    | grep -v "^-- Name: $1; Type: SCHEMA" | grep -v "^CREATE SCHEMA $1;" \
+    | grep -v 'connect' | grep -v 'restrict'
+}
+# The scratch schema was just built from migrations+seed; a schema-only
+# dump is therefore exactly the migrations' DDL. If schema.sql drifted,
+# this fails after anyone edits a migration without regenerating
+# (scripts/gen-schema.sh).
+norm_dump "$SCRATCH_SCHEMA" | diff - <(norm_dump "$CHK_SCHEMA") > "$WORK/schema-diff" \
+  || fail "schema.sql has drifted from db/migrations — run scripts/gen-schema.sh (diff in $WORK/schema-diff)"
+PGOPTIONS= psql "$TAPEBERG_DB_URL" -Xq -c "DROP SCHEMA IF EXISTS $CHK_SCHEMA CASCADE" >/dev/null
+echo "schema.sql matches the migrations"
 PSQL="psql $TAPEBERG_DB_URL -tAq"
 
 say "blanking VTL media (erase prior test data — capacity persists otherwise)"

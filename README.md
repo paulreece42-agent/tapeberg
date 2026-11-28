@@ -21,6 +21,11 @@ changer = manual
 telegram_token = ...        # or webhook_url / webhook_token
 ```
 
+A commented starting point is [config.example](config.example): copy it
+to `/etc/tapeberg.conf` and trim. The full catalog schema as one file is
+[schema.sql](schema.sql) (generated from `db/migrations/`, which remain
+canonical — see [docs/database.md](docs/database.md)).
+
 ```sh
 go build -o tapeberg .
 export TAPEBERG_DB_URL=postgres://...        # catalog (db/migrations/)
