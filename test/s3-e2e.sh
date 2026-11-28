@@ -428,6 +428,19 @@ AMPID=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-admin-mp --q
 [ -n "$AMPID" ] || fail "admin could not initiate multipart into the system bucket"
 $AWS s3api abort-multipart-upload --bucket vtl --key s3e2e-admin-mp --upload-id "$AMPID" >/dev/null || true
 
+say "multipart initiation over a taken key 409s cleanly (issue #37)"
+# v0 has no overwrite — initiation must state that with S3's conflict
+# code, like putObject's 409 for the same key, instead of letting the
+# 0011 index (objects_bucket_key_live_uniq) surface as a 500.
+if $AWS s3api create-multipart-upload --bucket vtl --key s3e2e-obj >/dev/null 2>&1; then
+  fail "initiating multipart over an existing key must be refused"
+fi
+CRS2=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-obj 2>&1) || true
+echo "$CRS2" | grep -q OperationAborted || fail "expected OperationAborted 409 for initiation over a taken key, got: $CRS2"
+# The 409 must be reachable honestly: after the collision upload is
+# refused, the object that owns the key is untouched and still readable.
+$AWS s3api get-object --bucket vtl --key s3e2e-obj "$WORK/ck-out" >/dev/null || fail "collision check damaged the key owner's object"
+
 say "user rm; static key returns"
 "$BIN" user rm alice
 "$BIN" user rm siteadmin
