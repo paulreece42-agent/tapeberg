@@ -503,8 +503,21 @@ func repackPass(db *sql.DB, cfg Config, ch Changer) error {
 			continue
 		}
 		aborted := false
-		for _, f := range files {
+		for i, f := range files {
 			tmp := filepath.Join(cfg.BufferDir, fmt.Sprintf("repack-%d", f.TapeFileID))
+			// repackOneFile loads the TARGET tape to write the copy, so the
+			// drive no longer holds the source. Reload it before every read
+			// after the first, or file 2+ is read from the target tape at the
+			// source's file position: a false checksum mismatch (the tape is
+			// then logged SUSPECT and left half-moved) or, with no sha on
+			// record, the wrong bytes re-archived.
+			if i > 0 {
+				if err := ch.Load(src.Barcode); err != nil {
+					fmt.Printf("worker: repack — cannot reload %s for file %d: %v (tape left as-is)\n", src.Barcode, f.PhysicalFile, err)
+					aborted = true
+					break
+				}
+			}
 			sha, rerr := readTapeFile(cfg.Drive, f.PhysicalFile, tmp)
 			if rerr != nil {
 				fmt.Printf("worker: repack — %s file %d read failed: %v (tape left as-is)\n", src.Barcode, f.PhysicalFile, rerr)
@@ -534,7 +547,7 @@ func repackPass(db *sql.DB, cfg Config, ch Changer) error {
 		if err := ch.Unload(); err != nil {
 			return err
 		}
-		fmt.Printf("worker: repack — %s retired (%d bytes reclaimed; erase + re-add to reuse)\n", src.Barcode, src.Dead)
+		fmt.Printf("worker: repack — %s retired (%d bytes reclaimed; erase + 'tapeberg tape reuse %s' to reuse)\n", src.Barcode, src.Dead, src.Barcode)
 	}
 	return nil
 }

@@ -422,18 +422,46 @@ export AWS_ACCESS_KEY_ID="$TAPEBERG_S3_KEY" AWS_SECRET_ACCESS_KEY="$TAPEBERG_S3_
 $AWS s3api list-buckets >/dev/null || fail "static env key must work again once no users exist"
 
 say "delete: tombstone semantics (S3 DeleteObject + multipart)"
-# 50 + 36 MiB fits one tape's PHYSICAL capacity (~96 MiB for random
-# data — nominal is 100) so the pair co-locates; deleting del-a leaves
-# the tape 58% dead, over the repack threshold.
-dd if=/dev/urandom of="$WORK/del-a" bs=1M count=50 status=none
-dd if=/dev/urandom of="$WORK/del-b" bs=1M count=36 status=none
+# Repack regression setup (issue #29): three objects on ONE tape, then
+# one is deleted so the tape crosses the repack threshold with TWO live
+# files. Co-locating by upload order races against whatever capacity
+# earlier sections left, so instead make pickTape do it: inflate every
+# other tape's written_bytes past its capacity for one worker pass —
+# pickTape requires written_bytes + size <= capacity_bytes, so the only
+# eligible target is a fresh tape. The chosen tape is physically blank
+# (the suite erases all VTL media at startup), so the drive's file
+# positions and the catalog agree, and the inflation is undone exactly.
+# Flush any unrelated pending archives from earlier sections first: each
+# worker pass runs the FULL drain, and leftovers landing on the reserved
+# tape would dilute the dead-byte fraction below the threshold (observed:
+# two stray objects made it 43% dead instead of 50%). This must happen
+# BEFORE the trio's puts — a PUT creates its archive request, so anything
+# queued before the inflation pass gets archiving onto the reserved tape.
+"$BIN" worker >/dev/null || fail "worker failed draining leftovers"
+REPACK_TAPE=$($PSQL -c "SELECT t.barcode FROM tapes t JOIN tape_pools p ON p.id=t.pool_id WHERE p.name='vtl' AND t.state='active' AND t.is_cleaning=false AND t.written_bytes=0 ORDER BY t.barcode LIMIT 1")
+[ -n "$REPACK_TAPE" ] || fail "no fresh tape left for the repack fixture"
+$PSQL >/dev/null -c "UPDATE tapes SET written_bytes = written_bytes + 100000000000 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl') AND barcode <> '$REPACK_TAPE'" \
+  || fail "repack fixture: capacity inflation failed"
+dd if=/dev/urandom of="$WORK/del-a" bs=1M count=40 status=none
+dd if=/dev/urandom of="$WORK/del-b" bs=1M count=20 status=none
+dd if=/dev/urandom of="$WORK/del-c" bs=1M count=20 status=none
 $AWS s3api put-object --bucket vtl --key s3e2e-del-a --body "$WORK/del-a" >/dev/null || fail "put del-a failed"
-sleep 1 # distinct requested_at => strict FIFO (a tie once split the pair across tapes)
 $AWS s3api put-object --bucket vtl --key s3e2e-del-b --body "$WORK/del-b" >/dev/null || fail "put del-b failed"
-"$BIN" worker >/dev/null || fail "worker failed archiving del-a/del-b"
+$AWS s3api put-object --bucket vtl --key s3e2e-del-c --body "$WORK/del-c" >/dev/null || fail "put del-c failed"
+# The pass that archives the trio must NOT also repack: with the
+# inflation active every other tape _reads_ as 99% dead (100GB written,
+# ~0 live) and the repack in the same worker run would "reclaim" them
+# — observed marking a dozen blank tapes retired and aborting on false
+# checksum mismatches. Threshold 0 disables repack for this invocation;
+# the real repack runs later in its own section at the configured 50.
+TAPEBERG_REPACK_THRESHOLD=0 "$BIN" worker > "$WORK/trio-worker.log" 2>&1 || fail "worker failed archiving del-a/del-b/del-c"
+cat "$WORK/trio-worker.log"
+$PSQL >/dev/null -c "UPDATE tapes SET written_bytes = written_bytes - 100000000000 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl') AND barcode <> '$REPACK_TAPE'" \
+  || fail "repack fixture: deflation failed"
 OLD=$($PSQL -c "SELECT t.barcode FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-del-b'")
-OLD_A=$($PSQL -c "SELECT t.barcode FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-del-a'")
-[ "$OLD" = "$OLD_A" ] || fail "test design: del-a ($OLD_A) and del-b ($OLD) must co-locate for the repack assertion"
+[ "$OLD" = "$REPACK_TAPE" ] || fail "repack fixture: del-b on '$OLD', want the reserved tape $REPACK_TAPE"
+[ "$($PSQL -c "SELECT count(DISTINCT t.barcode) FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key IN ('s3e2e-del-a','s3e2e-del-b','s3e2e-del-c')")" = 1 ] \
+  || fail "repack fixture: the trio is not on one tape"
 $AWS s3api delete-object --bucket vtl --key s3e2e-del-a || fail "delete-object failed"
 $AWS s3api delete-object --bucket vtl --key s3e2e-tar-pipe || fail "multipart delete-object failed"
 if $AWS s3api head-object --bucket vtl --key s3e2e-del-a >/dev/null 2>&1; then
@@ -459,6 +487,15 @@ $AWS s3api restore-object --bucket vtl --key s3e2e-del-b --restore-request Days=
 "$BIN" worker >/dev/null || fail "worker failed restoring repacked object"
 $AWS s3api get-object --bucket vtl --key s3e2e-del-b "$WORK/del-b-out" >/dev/null || fail "get of repacked object failed"
 cmp "$WORK/del-b" "$WORK/del-b-out" || fail "repacked bytes differ from upload"
+# The second live file is the regression: the old loop read it from the
+# TARGET tape (still loaded after the first write) and either aborted the
+# whole repack as a false SUSPECT or archived the wrong bytes.
+NEW_C=$($PSQL -c "SELECT t.barcode FROM tape_files tf JOIN tapes t ON t.id=tf.tape_id JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-del-c'")
+[ "$NEW_C" = "$NEW" ] || fail "del-c should have moved with del-b ($OLD -> '$NEW_C', want $NEW) — repack likely aborted on a false SUSPECT"
+$AWS s3api restore-object --bucket vtl --key s3e2e-del-c --restore-request Days=1 || fail "restore of second repacked object failed"
+"$BIN" worker >/dev/null || fail "worker failed restoring second repacked object"
+$AWS s3api get-object --bucket vtl --key s3e2e-del-c "$WORK/del-c-out" >/dev/null || fail "get of second repacked object failed"
+cmp "$WORK/del-c" "$WORK/del-c-out" || fail "second repacked object's bytes differ from upload"
 
 say "erasure coding: RAIT 2+1 stripe across three tapes, three drives"
 "$BIN" pool set vtl --ec-k 2 --ec-m 1 || fail "pool set --ec-k/--ec-m failed"
