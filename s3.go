@@ -819,6 +819,12 @@ func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket
 	if err != nil || !canSee(u, owner) {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
+	// v0 has no overwrite; the upload's placeholder object row would
+	// otherwise collide on objects_bucket_key_live_uniq and surface as
+	// a 500. Say 409 like putObject does (issue #37).
+	if _, err := getObjectIn(s.db, bucket, key); err == nil {
+		return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
+	}
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return err
@@ -986,6 +992,13 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 				http.StatusBadRequest)
 		}
 	}
+	// v0 has no overwrite: the completed key must be free. This check
+	// MUST come before the unlisted-part drops below, or the 409 a
+	// client can correct (retry with a different key) arrives after we
+	// already destroyed the parts it would retry with (issue #37).
+	if _, err := getObjectIn(s.db, bucket, key); err == nil {
+		return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
+	}
 	for _, p := range parts {
 		if !listed[p.Number] {
 			if _, err := s.db.Exec(`DELETE FROM archive_requests
@@ -1005,10 +1018,6 @@ func (s *s3srv) completeMultipart(w http.ResponseWriter, r *http.Request, bucket
 				return err
 			}
 		}
-	}
-	// v0 has no overwrite: the completed key must be free.
-	if _, err := getObjectIn(s.db, bucket, key); err == nil {
-		return errS3("OperationAborted", "key exists (v0 has no overwrite)", http.StatusConflict)
 	}
 	// S3-style multipart ETag: md5 of the concatenated binary part md5s.
 	h := md5.New()
