@@ -180,8 +180,14 @@ func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 			continue
 		}
 		if werr != nil {
-			_ = failArchive(db, req.ID, werr.Error())
+			// Report the failure before bailing: a swallowed error here
+			// leaves the request pending and the drain spins on it
+			// (issue #42). Unload stays best effort.
+			fer := failArchive(db, req.ID, werr.Error())
 			_ = ch.Unload()
+			if fer != nil {
+				return fer
+			}
 			return nil // request terminal; drain continues with the next
 		}
 		if err := insertTapeFile(db, tape.ID, req.ObjectID, int64(req.PartNumber), archiveID, physical, req.Size); err != nil {
@@ -282,11 +288,15 @@ func restoreOne(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
 	}
 	tf, err := objectTapeFile(db, req.ObjectID)
 	if err != nil {
-		_ = failRetrieve(db, req.ID, err.Error())
+		if ferr := failRetrieve(db, req.ID, err.Error()); ferr != nil {
+			return ferr
+		}
 		return nil
 	}
 	if err := ch.Load(tf.Barcode); err != nil {
-		_ = failRetrieve(db, req.ID, err.Error())
+		if ferr := failRetrieve(db, req.ID, err.Error()); ferr != nil {
+			return ferr
+		}
 		return nil
 	}
 	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
@@ -298,14 +308,20 @@ func restoreOne(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) error {
 	sha, rerr := readTapeFile(cfg.Drive, tf.PhysicalFile, dst)
 	if rerr != nil {
 		_ = os.Remove(dst)
-		_ = failRetrieve(db, req.ID, rerr.Error())
+		fer := failRetrieve(db, req.ID, rerr.Error())
 		_ = ch.Unload()
+		if fer != nil {
+			return fer
+		}
 		return nil
 	}
 	if req.SHA256 != "" && sha != req.SHA256 {
 		_ = os.Remove(dst)
-		_ = failRetrieve(db, req.ID, fmt.Sprintf("checksum mismatch: tape %s gave %s, expected %s", tf.Barcode, sha, req.SHA256))
+		fer := failRetrieve(db, req.ID, fmt.Sprintf("checksum mismatch: tape %s gave %s, expected %s", tf.Barcode, sha, req.SHA256))
 		_ = ch.Unload()
+		if fer != nil {
+			return fer
+		}
 		return nil
 	}
 	if err := objectToStandard(db, req.ObjectID, dst); err != nil {
@@ -337,7 +353,9 @@ func restoreOneEC(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq, ec *ECCo
 	// default), and the placements live under that part.
 	if err := ecRestorePart(db, cfg, ch, req.ObjectID, 1, ec, size, req.SHA256, dst); err != nil {
 		_ = os.Remove(dst)
-		_ = failRetrieve(db, req.ID, "RAIT restore: "+err.Error())
+		if ferr := failRetrieve(db, req.ID, "RAIT restore: "+err.Error()); ferr != nil {
+			return ferr
+		}
 		return nil
 	}
 	if err := objectToStandard(db, req.ObjectID, dst); err != nil {
@@ -368,7 +386,9 @@ func restoreMultipart(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) erro
 		return err
 	}
 	if len(parts) == 0 {
-		_ = failRetrieve(db, req.ID, "multipart object has no tape placement (upload incomplete?)")
+		if ferr := failRetrieve(db, req.ID, "multipart object has no tape placement (upload incomplete?)"); ferr != nil {
+			return ferr
+		}
 		return nil
 	}
 	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
@@ -390,7 +410,9 @@ func restoreMultipart(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) erro
 		}
 		if p.Barcode != lastBar {
 			if err := ch.Load(p.Barcode); err != nil {
-				_ = failRetrieve(db, req.ID, err.Error())
+				if ferr := failRetrieve(db, req.ID, err.Error()); ferr != nil {
+					return ferr
+				}
 				return nil
 			}
 			lastBar = p.Barcode
@@ -400,15 +422,21 @@ func restoreMultipart(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq) erro
 		sha, newCur, rerr := readTapeFileAt(cfg.Drive, p.PhysicalFile, cur, dst)
 		if rerr != nil {
 			_ = os.Remove(dst)
-			_ = failRetrieve(db, req.ID, fmt.Sprintf("part %d: %v", p.Number, rerr))
+			fer := failRetrieve(db, req.ID, fmt.Sprintf("part %d: %v", p.Number, rerr))
 			_ = ch.Unload()
+			if fer != nil {
+				return fer
+			}
 			return nil
 		}
 		cur = newCur
 		if sha != p.SHA256 {
 			_ = os.Remove(dst)
-			_ = failRetrieve(db, req.ID, fmt.Sprintf("part %d checksum mismatch: tape %s gave %s, expected %s", p.Number, p.Barcode, sha, p.SHA256))
+			fer := failRetrieve(db, req.ID, fmt.Sprintf("part %d checksum mismatch: tape %s gave %s, expected %s", p.Number, p.Barcode, sha, p.SHA256))
 			_ = ch.Unload()
+			if fer != nil {
+				return fer
+			}
 			return nil
 		}
 		if err := setPartDiskPath(db, req.ObjectID, p.Number, dst); err != nil {
@@ -892,7 +920,9 @@ func restoreMultipartEC(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq, ec
 		return err
 	}
 	if len(parts) == 0 {
-		_ = failRetrieve(db, req.ID, "multipart object has no parts (upload incomplete?)")
+		if ferr := failRetrieve(db, req.ID, "multipart object has no parts (upload incomplete?)"); ferr != nil {
+			return ferr
+		}
 		return nil
 	}
 	if err := setRetrieveState(db, req.ID, "restoring"); err != nil {
@@ -908,7 +938,9 @@ func restoreMultipartEC(db *sql.DB, cfg Config, ch Changer, req *RetrieveReq, ec
 		dst := filepath.Join(cfg.BufferDir, fmt.Sprintf("part-%d-%05d", req.ObjectID, p.Number))
 		if err := ecRestorePart(db, cfg, ch, req.ObjectID, int64(p.Number), ec, p.Size, p.SHA256, dst); err != nil {
 			_ = os.Remove(dst)
-			_ = failRetrieve(db, req.ID, fmt.Sprintf("part %d: %v", p.Number, err))
+			if ferr := failRetrieve(db, req.ID, fmt.Sprintf("part %d: %v", p.Number, err)); ferr != nil {
+				return ferr
+			}
 			return nil
 		}
 		if err := setPartDiskPath(db, req.ObjectID, p.Number, dst); err != nil {
