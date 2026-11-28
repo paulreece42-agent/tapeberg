@@ -526,6 +526,29 @@ grep -q "RAIT" "$WORK/ec2.log" || fail "degraded restore did not run the EC path
 $AWS s3api get-object --bucket vtl --key s3e2e-ec "$WORK/ec-out2" >/dev/null || fail "get after tape loss failed"
 cmp "$WORK/ec-src" "$WORK/ec-out2" || fail "degraded EC bytes differ — parity reconstruction broken"
 
+say "erasure coding: single drive (no TAPEBERG_DRIVES) must still stripe across 3 tapes"
+# Issue #30: the sequential path loaded all three shard tapes in a row
+# through ONE drive (each load ejecting the previous), then wrote every
+# shard to the last-loaded tape. The catalog looked correct — 3 distinct
+# tapes, 3 verifiers — but only one tape physically held bytes.
+dd if=/dev/urandom of="$WORK/ec-src2" bs=1M count=12 status=none
+$AWS s3api put-object --bucket vtl --key s3e2e-ec-single --body "$WORK/ec-src2" >/dev/null || fail "put single-drive EC object failed"
+TAPEBERG_DRIVES= "$BIN" worker > "$WORK/ec-single.log" 2>&1 || fail "single-drive worker failed striping the EC object"
+grep -q "RAIT 2+1" "$WORK/ec-single.log" || fail "single-drive archive did not run the EC path: $(tail -2 "$WORK/ec-single.log")"
+NTAPES=$($PSQL -c "SELECT count(DISTINCT tf.tape_id) FROM tape_files tf JOIN objects o ON o.id=tf.object_id WHERE o.key='s3e2e-ec-single'")
+[ "$NTAPES" = 3 ] || fail "single-drive shards must sit on 3 distinct tapes, got $NTAPES"
+# The catalog looking right is not the point — the PHYSICS is. Restoring
+# proves each claimed placement really holds its shard: on the old code
+# only the last-loaded tape had bytes, so this read fails its sha check
+# and the restore ends failed.
+$AWS s3api restore-object --bucket vtl --key s3e2e-ec-single --restore-request Days=1 || fail "single-drive EC restore request failed"
+"$BIN" worker > "$WORK/ec-single-restore.log" 2>&1 || fail "worker failed single-drive EC restore"
+RSTATE=$($PSQL -c "SELECT state FROM retrieve_requests WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-ec-single') ORDER BY id DESC LIMIT 1")
+[ "$RSTATE" = restored ] || fail "single-drive EC restore ended '$RSTATE': $($PSQL -c "SELECT left(COALESCE(error,''),200) FROM retrieve_requests WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-ec-single') ORDER BY id DESC LIMIT 1")"
+$AWS s3api get-object --bucket vtl --key s3e2e-ec-single "$WORK/ec-single-out" >/dev/null || fail "get of single-drive EC object failed"
+cmp "$WORK/ec-src2" "$WORK/ec-single-out" || fail "single-drive EC round-trip bytes differ"
+echo "single-drive EC: 3 distinct tapes, restore verifies every shard's sha"
+
 kill $SRV_PID 2>/dev/null || true
 SRV_PID=""
 printf '\nS3 E2E PASS — Glacier wire contract verified via awscli\n'

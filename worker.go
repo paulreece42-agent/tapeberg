@@ -662,6 +662,16 @@ func ecArchive(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq, ec *ECConfig
 		if parallel && len(batch) > len(drives) {
 			batch = batch[:len(drives)]
 		}
+		// Single drive (or manual changer): one shard per round. The
+		// load loop below drives ONE device, so loading all the batch's
+		// tapes in a row leaves only the LAST one mounted — writing the
+		// whole batch then puts every shard on that tape (the catalog
+		// still claims k+m distinct tapes, so restores read blank tape
+		// and fail the shard checksums). One at a time, the load before
+		// each write actually mounts the tape being written.
+		if !parallel {
+			batch = batch[:1]
+		}
 
 		// Load this batch: one shard tape per drive.
 		for j, i := range batch {
