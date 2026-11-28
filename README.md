@@ -1,6 +1,12 @@
 # Tapeberg
 
-**Work in progress.** Personal AWS-Glacier-style cold archive on your own
+**Hobby-Project; Work in progress; Don't use in prod yet** 
+
+A better, more battle-tested way to do this in production 
+(with open-source tools only) would be to use CERN'S CTA, 
+with dCache, and the dCache-s3 plugin
+
+Personal AWS-Glacier-style cold archive on your own
 LTO tapes. Go + PostgreSQL + cron. Drives an autochanger robot via `mtx`,
 or runs in **manual mode**: it pings you on Telegram/a webhook — "load
 tape TB0003L5" — and waits for `tapeberg ack`.
