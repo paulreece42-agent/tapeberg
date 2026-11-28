@@ -1144,14 +1144,29 @@ func (c *concatReadSeeker) total() int64 {
 
 func (c *concatReadSeeker) Read(p []byte) (int, error) {
 	if c.pos >= c.total() {
+		if len(p) == 0 {
+			return 0, nil
+		}
 		return 0, io.EOF
 	}
-	// locate the part containing pos
+	// Locate the part containing pos and read at the exact offset.
+	// ReadAt keeps every part file positionless: the old per-file cursor
+	// went stale after a backward seek (Seek repositioned only the target
+	// part), and the next Read then continued a later part from mid-file
+	// — bytes skipped, served with 200/206 (issue #41).
 	var base int64
 	for i, s := range c.sizes {
 		if c.pos < base+s {
-			n, err := c.parts[i].Read(p)
+			n, err := c.parts[i].ReadAt(p, c.pos-base)
 			c.pos += int64(n)
+			if err != nil && err != io.EOF {
+				return n, err
+			}
+			// ReadAt reports EOF whenever it hit this part's end, but
+			// more parts may follow: EOF is only true at the very end.
+			if n > 0 && c.pos < c.total() {
+				err = nil
+			}
 			return n, err
 		}
 		base += s
@@ -1174,16 +1189,5 @@ func (c *concatReadSeeker) Seek(offset int64, whence int) (int64, error) {
 		return 0, fmt.Errorf("negative seek")
 	}
 	c.pos = target
-	// position the underlying file
-	var base int64
-	for i, s := range c.sizes {
-		if c.pos < base+s || c.pos == total && i == len(c.sizes)-1 {
-			if _, err := c.parts[i].Seek(c.pos-base, io.SeekStart); err != nil {
-				return 0, err
-			}
-			break
-		}
-		base += s
-	}
 	return c.pos, nil
 }
