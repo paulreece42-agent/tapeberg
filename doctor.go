@@ -39,19 +39,25 @@ func cmdDoctor(cfg Config, args []string) error {
 		}
 	}
 
-	// 2. Auth backend: who may talk to the S3 endpoint.
-	var users int
-	if err := db.QueryRow(`SELECT count(*) FROM s3_users`).Scan(&users); err == nil {
-		switch {
-		case users > 0:
-			fmt.Printf("✓ auth: %s (%d user(s) in catalog; static env key inactive)\n", cfg.Auth, users)
-		case cfg.S3Key != "":
-			fmt.Printf("△ auth: no users — using the static TAPEBERG_S3_KEY (create one: tapeberg user add <uid> --full-name X --email Y)\n")
-		default:
-			fmt.Printf("△ auth: UNSIGNED dev mode — anyone reaching the S3 port can read/write\n")
+	// 2. Auth backend: who may talk to the S3 endpoint (needs the catalog).
+	// Guarded on db — when the catalog is unreachable db is nil, and the
+	// auth check must print a warning, not panic around it.
+	if db != nil {
+		var users int
+		if err := db.QueryRow(`SELECT count(*) FROM s3_users`).Scan(&users); err == nil {
+			switch {
+			case users > 0:
+				fmt.Printf("✓ auth: %s (%d user(s) in catalog; static env key inactive)\n", cfg.Auth, users)
+			case cfg.S3Key != "":
+				fmt.Printf("△ auth: no users — using the static TAPEBERG_S3_KEY (create one: tapeberg user add <uid> --full-name X --email Y)\n")
+			default:
+				fmt.Printf("△ auth: UNSIGNED dev mode — anyone reaching the S3 port can read/write\n")
+			}
+		} else {
+			fmt.Printf("△ auth: %s backend has no user table yet (apply db/migrations)\n", cfg.Auth)
 		}
 	} else {
-		fmt.Printf("△ auth: %s backend has no user table yet (apply db/migrations)\n", cfg.Auth)
+		fmt.Printf("△ auth: catalog unreachable — auth state unknown\n")
 	}
 
 	// 3. Drive
