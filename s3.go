@@ -808,7 +808,15 @@ type initiateMultipartResult struct {
 }
 
 func (s *s3srv) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket, key string) error {
-	if _, err := bucketIDByName(s.db, bucket); err != nil {
+	// Tenancy guard, same rule as putObject: initiating an upload only
+	// checks that the bucket EXISTS otherwise, any authenticated user
+	// could park uploads in another user's bucket, holding the key
+	// hostage (the owner's own PUT of it 409s) with objects the owner
+	// cannot see. putPart and completeMultipart check the upload's
+	// owner — which is the caller — so initiation is the gate.
+	u := s.user(r)
+	owner, err := bucketOwner(s.db, bucket)
+	if err != nil || !canSee(u, owner) {
 		return errS3("NoSuchBucket", "bucket does not exist", http.StatusNotFound)
 	}
 	raw := make([]byte, 16)

@@ -386,6 +386,14 @@ if $AWS s3api get-object --bucket vtl --key s3e2e-obj "$WORK/tx" >/dev/null 2>&1
   fail "alice must not read another tenant's object"
 fi
 
+say "multipart tenancy: initiation is guarded like put (issue #31)"
+EMPID=$($AWS s3api create-multipart-upload --bucket alice-bkt --key alice-mp-tx --query UploadId --output text | tr -d '"')
+[ -n "$EMPID" ] || fail "alice could not initiate multipart in her own bucket"
+$AWS s3api abort-multipart-upload --bucket alice-bkt --key alice-mp-tx --upload-id "$EMPID" >/dev/null || fail "abort of own upload failed"
+if $AWS s3api create-multipart-upload --bucket vtl --key alice-mp-foreign >/dev/null 2>&1; then
+  fail "alice must not initiate multipart into another tenant's bucket (uploads would squat foreign keys)"
+fi
+
 say "suspend / unsuspend"
 "$BIN" user suspend alice
 if $AWS s3api list-buckets >/dev/null 2>&1; then
@@ -414,6 +422,11 @@ export AWS_ACCESS_KEY_ID="$ADM_AK" AWS_SECRET_ACCESS_KEY="$ADM_SK"
 $AWS s3api list-buckets --query "Buckets[].Name" --output text | grep -qw vtl || fail "admin must see the system bucket"
 $AWS s3api list-objects-v2 --bucket alice-bkt --query "Contents[].Key" --output text | grep -qw alice-hi || fail "admin must see alice's object"
 $AWS s3api get-object --bucket vtl --key s3e2e-obj "$WORK/adminget" >/dev/null || fail "admin cross-tenant get failed"
+# Control for the multipart-tenancy guard: an admin CAN initiate into
+# the system bucket (then cleans up).
+AMPID=$($AWS s3api create-multipart-upload --bucket vtl --key s3e2e-admin-mp --query UploadId --output text | tr -d '"')
+[ -n "$AMPID" ] || fail "admin could not initiate multipart into the system bucket"
+$AWS s3api abort-multipart-upload --bucket vtl --key s3e2e-admin-mp --upload-id "$AMPID" >/dev/null || true
 
 say "user rm; static key returns"
 "$BIN" user rm alice
