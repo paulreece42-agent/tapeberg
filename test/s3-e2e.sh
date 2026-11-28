@@ -575,6 +575,24 @@ $AWS s3api get-object --bucket vtl --key s3e2e-ec-single "$WORK/ec-single-out" >
 cmp "$WORK/ec-src2" "$WORK/ec-single-out" || fail "single-drive EC round-trip bytes differ"
 echo "single-drive EC: 3 distinct tapes, restore verifies every shard's sha"
 
+say "no tape fits: archives wait for media instead of failing (issue #40)"
+# Inflate EVERY tape past capacity: pickTape has no eligible target.
+# Archives must WAIT (request stays pending, worker exits 0) — the old
+# code failed the request permanently, which strands multipart
+# completions and only a manual SQL can undo. Repack is disabled for
+# this pass: inflated tapes read as 99% dead (see the repack fixture).
+dd if=/dev/urandom of="$WORK/wait-src" bs=1M count=1 status=none
+$AWS s3api put-object --bucket vtl --key s3e2e-wait-obj --body "$WORK/wait-src" >/dev/null || fail "put wait-obj failed"
+$PSQL >/dev/null -c "UPDATE tapes SET written_bytes = written_bytes + 100000000000 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl')" \
+  || fail "no-media fixture: inflation failed"
+TAPEBERG_REPACK_THRESHOLD=0 "$BIN" worker > "$WORK/wait-worker.log" 2>&1 \
+  || fail "worker must not die when the pool is out of tape space: $(tail -2 "$WORK/wait-worker.log")"
+grep -q 'wait for media' "$WORK/wait-worker.log" || fail "worker did not report the no-media wait"
+WSTATE=$($PSQL -c "SELECT state FROM archive_requests WHERE object_id=(SELECT id FROM objects WHERE key='s3e2e-wait-obj') ORDER BY id DESC LIMIT 1")
+[ "$WSTATE" = pending ] || fail "no-media archive must stay pending, got '$WSTATE'"
+$PSQL >/dev/null -c "UPDATE tapes SET written_bytes = written_bytes - 100000000000 WHERE pool_id=(SELECT id FROM tape_pools WHERE name='vtl')" \
+  || fail "no-media fixture: deflation failed"
+
 kill $SRV_PID 2>/dev/null || true
 SRV_PID=""
 printf '\nS3 E2E PASS — Glacier wire contract verified via awscli\n'
