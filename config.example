@@ -1,0 +1,85 @@
+# tapeberg config example — copy to /etc/tapeberg.conf (chmod 600: it
+# carries credentials) or ~/.config/tapeberg.conf.
+#
+# Format: `key = value`; the key is the TAPEBERG_* variable name minus
+# the TAPEBERG_ prefix (case-insensitive, - and _ interchangeable).
+# Comments are WHOLE LINES starting with # — in
+# `key = value  # note`, `# note` is part of the value.
+#
+# Precedence: environment > conf file > built-in default. A conf file
+# never overrides a variable already in the environment. The full,
+# authoritative list of keys lives in docs/config.md.
+
+# ---- Catalog -------------------------------------------------------
+# Required. PostgreSQL catalog (see docs/database.md).
+db_url = postgres://tapeberg:@127.0.0.1:5432/tapeberg
+
+# ---- Hardware (per node) -------------------------------------------
+# Required. The non-rewinding device for single-stream reads/writes.
+# Robot mode: the library's DTE 0 drive. Required by every command,
+# even `s3` on an endpoint-only node.
+# Kernel numbering reshuffles across reboots — always use the stable
+# udev link (docs/config.md#stable-device-names), never /dev/nstN.
+drive = /dev/tape/by-id/scsi-HU1325W88B-nst
+
+# All of the library's drives, comma-separated, in DTE order; the first
+# entry should equal `drive`. Parallel RAIT shard writes use them.
+#drives = /dev/tape/by-id/scsi-TB-DRIVE01-nst,/dev/tape/by-id/scsi-TB-DRIVE02-nst,/dev/tape/by-id/scsi-TB-DRIVE03-nst
+
+# robot (autochanger via mtx, default) or manual (a human loads tapes
+# when pinged and runs `tapeberg ack`).
+changer = manual
+
+# Robot mode: the changer device for `mtx -f`. Unset auto-discovers the
+# first `mediumx` device lsscsi lists (fine with one library). Use the
+# stable by-id changer link; NOT /dev/schN (mtx fails on it).
+#changer_dev = /dev/tape/by-id/scsi-SSPECTRA_PYTHON_TAPEBERG1-changer
+
+# Manual mode: where the worker writes its prompt and `tapeberg ack`
+# writes the acknowledgement.
+#ack_dir = /run/tapeberg
+
+# ---- Buffer and pool -------------------------------------------------
+# Required. Staging directory; also holds the worker lock, so workers
+# sharing a buffer run one at a time.
+buffer = /var/lib/tapeberg
+
+# The pool this process serves. A worker drains only this pool's queues
+# and writes only this pool's tapes; the S3 endpoint binds new buckets
+# to it.
+#pool = default
+
+# ---- Policy ----------------------------------------------------------
+# Percent of a tape's written bytes that must be dead (deleted objects)
+# before the worker repacks it.
+#repack_threshold = 50
+
+# Multipart uploads neither completed nor aborted after this many days
+# are tombstoned by the worker janitor. 0 disables the sweep.
+#upload_ttl_days = 7
+
+# Multipart part size limits (S3-style): the minimum applies to every
+# part but the last; on real tape, 64-128 MiB keeps LTO streaming.
+#part_min_bytes = 5242880
+#part_max_bytes = 5368709120
+
+# ---- S3 endpoint (`tapeberg s3`) --------------------------------------
+# Listen address (a positional argument on the command line overrides).
+#s3_listen = :7333
+
+# Auth backend. `builtin` = users and keys in the catalog
+# (`tapeberg user add`). Unset S3 key/secret with no users = unsigned
+# dev mode (fine for a test rig; bind s3_listen to 127.0.0.1 there).
+#auth = builtin
+
+# Legacy static key pair, used only while the catalog has NO users.
+#s3_key = change-me
+#s3_secret = change-me-too
+
+# ---- Notifications (manual changer) ------------------------------------
+# Any mix, all optional: the worker pings you to load a tape, and
+# `tapeberg doctor --notify-test` sends a test message.
+#telegram_token = 123456:ABCDEF...
+#telegram_chat = 123456789
+#webhook_url = https://hooks.slack.com/services/XXX/YYY/ZZZ
+#webhook_token =
