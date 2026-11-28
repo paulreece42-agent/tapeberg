@@ -17,6 +17,11 @@ import (
 	"time"
 )
 
+// errArchiveWaiting ends an archive pass when the pool has no tape that
+// fits: the request stays pending for media to be added, instead of the
+// old failArchive that stranded it permanently (issue #40).
+var errArchiveWaiting = errors.New("archives waiting for media")
+
 // Config is the validated environment configuration (see main.go).
 type Config struct {
 	DBURL       string
@@ -139,6 +144,17 @@ func drainArchives(db *sql.DB, cfg Config, ch Changer) error {
 			return nil
 		}
 		if err := archiveOne(db, cfg, ch, &reqs[0]); err != nil {
+			if errors.Is(err, errArchiveWaiting) {
+				// The pool is out of tape space: leave everything pending
+				// and end the pass — the retrieves and repack still run.
+				// Failing here would permanently strand the batch and its
+				// callers would report success (issue #40).
+				fmt.Printf("worker: pool %s: no tape fits — %d archive request(s) wait for media\n", cfg.Pool, len(reqs))
+				if n := NewNotifierFromEnv(); n.Enabled() {
+					_ = n.Notify(fmt.Sprintf("📼 tapeberg: pool %s has no tape that fits — %d archive request(s) waiting for media", cfg.Pool, len(reqs)))
+				}
+				return nil
+			}
 			return err
 		}
 	}
@@ -155,6 +171,11 @@ func archiveOne(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq) error {
 	for try := 0; try < 8; try++ {
 		tape, err := pickTape(db, cfg.Pool, req.Size)
 		if err != nil {
+			// Out of tape space: leave pending for a future pass with
+			// more media instead of failing permanently (issue #40).
+			if errors.Is(err, ErrNotFound) {
+				return errArchiveWaiting
+			}
 			return failArchive(db, req.ID, err.Error())
 		}
 		if err := ch.Load(tape.Barcode); err != nil {
@@ -637,11 +658,16 @@ func ecArchive(db *sql.DB, cfg Config, ch Changer, req *ArchiveReq, ec *ECConfig
 	}()
 
 	// One target tape per shard, all distinct, sibling-aware.
+	// Exhaustion (out of tape space) leaves the request pending instead
+	// of permanently failing it (issue #40).
 	targets := make([]*Tape, len(shards))
 	used := []int64{}
 	for i := range shards {
 		t, err := pickShardTarget(db, cfg.Pool, shards[i].Size, used, req.ObjectID, int64(req.PartNumber))
 		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return errArchiveWaiting
+			}
 			return failArchive(db, req.ID, fmt.Sprintf("ec stripe: %v", err))
 		}
 		used = append(used, t.ID)

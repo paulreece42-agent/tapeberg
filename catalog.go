@@ -297,7 +297,7 @@ func pickTapeExcluding(db *sql.DB, pool string, size int64, exclude int64) (*Tap
 	err := db.QueryRow(q, size, pool, exclude).
 		Scan(&t.ID, &t.Barcode, &t.CapacityBytes, &t.WrittenBytes)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("no active tape in pool %q fits %d bytes", pool, size)
+		return nil, fmt.Errorf("no active tape in pool %q fits %d bytes: %w", pool, size, ErrNotFound)
 	}
 	return t, err
 }
@@ -640,7 +640,7 @@ func pickShardTarget(db *sql.DB, pool string, size int64, exclude []int64, objec
 	err := db.QueryRow(q, size, pool, pq.Array(exclude), objectID, partNumber).
 		Scan(&t.ID, &t.Barcode, &t.CapacityBytes, &t.WrittenBytes)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("no distinct active tape in pool %q fits a %d-byte shard", pool, size)
+		return nil, fmt.Errorf("no distinct active tape in pool %q fits a %d-byte shard: %w", pool, size, ErrNotFound)
 	}
 	return t, err
 }
